@@ -1,0 +1,230 @@
+"""Orchestration of the one-way pipeline (AGENTS.md section 4.1).
+
+Order per run:
+1. FR-11 — retry posts left as ``to_send`` by an earlier run.
+2. FR-1  — fetch/parse all configured RSS feeds.
+3. per post: FR-2 duplicate check -> FR-3..FR-8 single LLM call -> FR-9 store ->
+   FR-10 send when the record qualifies.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Sequence
+
+from app.analyzer import LlmOutputError, analyze_post, load_system_prompt
+from app.formatting import format_post_message
+from app.llm_client import LlmClient
+from app.models import (
+    IMPORTANCE_ORDER,
+    AnalyzedPost,
+    LlmAnalysis,
+    PostRecord,
+    PostStatus,
+    RawPost,
+    SimilarityCandidate,
+)
+from app.reddit_source import fetch_posts
+from app.repository import PostRepository
+from app.settings import Settings, TopicConfig, topic_display_names
+from app.telegram_notifier import TelegramNotifier
+
+logger = logging.getLogger(__name__)
+
+
+def meets_importance_threshold(importance: str | None, minimum: str) -> bool:
+    """FR-10(c) — is ``importance`` at least ``minimum``?"""
+    if importance not in IMPORTANCE_ORDER or minimum not in IMPORTANCE_ORDER:
+        return False
+    return IMPORTANCE_ORDER[importance] >= IMPORTANCE_ORDER[minimum]
+
+
+def determine_status(
+    analysis: LlmAnalysis,
+    *,
+    duplicate_of_id: int | None,
+    min_importance_to_send: str,
+) -> PostStatus:
+    """Decide the persisted status of an analysed post (FR-2/FR-10/Invariant 2)."""
+    if not analysis.is_relevant:
+        return "skipped_irrelevant"
+    if duplicate_of_id is not None:
+        return "skipped_duplicate"
+    if not meets_importance_threshold(analysis.importance, min_importance_to_send):
+        return "skipped_low_importance"
+    return "to_send"
+
+
+def build_analyzed_post(
+    post: RawPost,
+    *,
+    status: PostStatus,
+    analysis: LlmAnalysis | None = None,
+    duplicate_of_id: int | None = None,
+    raw_response: dict[str, Any] | None = None,
+) -> AnalyzedPost:
+    """Flatten a raw post (+ optional analysis) into the row to insert (FR-9)."""
+    return AnalyzedPost(
+        reddit_id=post.reddit_id,
+        subreddit=post.subreddit,
+        source_topic_key=post.source_topic_key,
+        title=post.title,
+        url=post.url,
+        author=post.author,
+        raw_content=post.raw_content,
+        published_at=post.published_at,
+        is_relevant=analysis.is_relevant if analysis else None,
+        duplicate_of_id=duplicate_of_id,
+        topic=analysis.topic if analysis else None,
+        importance=analysis.importance if analysis else None,
+        summary_fa=analysis.summary_fa if analysis else None,
+        key_points=list(analysis.key_points_fa) if analysis else [],
+        llm_raw_response=raw_response,
+        status=status,
+    )
+
+
+def to_post_record(analyzed: AnalyzedPost, post_id: int) -> PostRecord:
+    """Build the in-memory record that is formatted and sent after storing."""
+    fields = set(PostRecord.model_fields) - {"id", "status"}
+    return PostRecord(
+        id=post_id,
+        status=analyzed.status,
+        **analyzed.model_dump(include=fields),
+    )
+
+
+class Pipeline:
+    """Wires the modules together; holds no I/O logic of its own beyond orchestration."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        repository: PostRepository,
+        llm_client: LlmClient,
+        notifier: TelegramNotifier,
+        topics: Sequence[TopicConfig],
+        system_prompt: str | None = None,
+    ) -> None:
+        self._settings = settings
+        self._repository = repository
+        self._llm_client = llm_client
+        self._notifier = notifier
+        self._topics = list(topics)
+        self._allowed_topics = [topic.key for topic in self._topics]
+        self._topic_names = topic_display_names(self._topics)
+        self._system_prompt = system_prompt if system_prompt is not None else load_system_prompt()
+
+    def run_once(self) -> None:
+        """One full pipeline cycle; never raises for a single bad post/feed."""
+        logger.info("Pipeline run started")
+        self.retry_pending_sends()
+
+        posts = fetch_posts(self._topics, max_retries=self._settings.http_max_retries)
+        for post in posts:
+            try:
+                self.process_post(post)
+            except Exception:
+                logger.exception(
+                    "Unexpected failure while processing reddit_id=%s; continuing",
+                    post.reddit_id,
+                )
+
+        logger.info("Pipeline run finished (%d fetched post(s))", len(posts))
+
+    def retry_pending_sends(self) -> None:
+        """FR-11 — finish sends from earlier runs without re-analysing them."""
+        pending = self._repository.fetch_pending_send()
+        if not pending:
+            return
+        logger.info("Retrying %d pending send(s) from earlier runs", len(pending))
+        for record in pending:
+            try:
+                self._send(record)
+            except Exception as exc:
+                logger.error(
+                    "Pending send still failing for reddit_id=%s: %s", record.reddit_id, exc
+                )
+
+    def process_post(self, post: RawPost) -> None:
+        """FR-2 -> FR-3..FR-8 -> FR-9 -> FR-10 for a single fetched post."""
+        if self._repository.exists(post.reddit_id):
+            logger.info("reddit_id=%s already stored, skipping LLM call", post.reddit_id)
+            return
+
+        candidates = self._repository.get_similarity_candidates(
+            limit=self._settings.similarity_lookback_limit,
+            hours=self._settings.similarity_lookback_hours,
+        )
+
+        try:
+            outcome = analyze_post(
+                post,
+                candidates,
+                llm_client=self._llm_client,
+                allowed_topics=self._allowed_topics,
+                system_prompt=self._system_prompt,
+            )
+        except LlmOutputError as exc:
+            # Invariant 3: invalid output is recorded as failed, never assumed valid.
+            logger.error("Invalid LLM output for reddit_id=%s: %s", post.reddit_id, exc)
+            self._repository.insert_post(
+                build_analyzed_post(post, status="failed", raw_response=exc.raw_response)
+            )
+            return
+        except Exception as exc:
+            # Transient LLM/network trouble: leave the post unfetched-in-DB so the next
+            # run analyses it again (no record, no send, no duplicate).
+            logger.error("LLM call failed for reddit_id=%s: %s", post.reddit_id, exc)
+            return
+
+        duplicate_of_id = self._resolve_duplicate(outcome.analysis, candidates)
+        status = determine_status(
+            outcome.analysis,
+            duplicate_of_id=duplicate_of_id,
+            min_importance_to_send=self._settings.min_importance_to_send,
+        )
+        analyzed = build_analyzed_post(
+            post,
+            status=status,
+            analysis=outcome.analysis,
+            duplicate_of_id=duplicate_of_id,
+            raw_response=outcome.raw_response,
+        )
+
+        # Invariant 2: store first, send only afterwards.
+        post_id = self._repository.insert_post(analyzed)
+        if post_id is None or status != "to_send":
+            return
+
+        try:
+            self._send(to_post_record(analyzed, post_id))
+        except Exception as exc:
+            # The row stays 'to_send' and FR-11 retries it on the next run.
+            logger.error("Sending failed for reddit_id=%s: %s", post.reddit_id, exc)
+
+    @staticmethod
+    def _resolve_duplicate(
+        analysis: LlmAnalysis, candidates: Sequence[SimilarityCandidate]
+    ) -> int | None:
+        """Invariant 4 — map the LLM's local 1-based index to a real database id."""
+        index = analysis.duplicate_of_candidate_index
+        if index is None:
+            return None
+        if 1 <= index <= len(candidates):
+            return candidates[index - 1].id
+        logger.warning("Ignoring out-of-range duplicate index %s returned by the LLM", index)
+        return None
+
+    def _topic_label(self, record: PostRecord) -> str | None:
+        return self._topic_names.get(record.topic or "") or self._topic_names.get(
+            record.source_topic_key
+        )
+
+    def _send(self, record: PostRecord) -> None:
+        """Format and send one post, then mark it as sent (FR-10)."""
+        self._notifier.send_message(
+            format_post_message(record, topic_name=self._topic_label(record))
+        )
+        self._repository.mark_sent(record.id)
