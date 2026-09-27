@@ -9,7 +9,6 @@ import logging
 import sys
 import time
 
-from app.llm_client import LlmClient
 from app.pipeline import Pipeline
 from app.repository import PostRepository, connect
 from app.settings import Settings, TopicConfig, get_settings, load_topics
@@ -30,15 +29,6 @@ def setup_logging(level: str) -> None:
     )
 
 
-def build_llm_client(settings: Settings) -> LlmClient:
-    return LlmClient(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        model=settings.openai_model,
-        max_retries=settings.http_max_retries,
-    )
-
-
 def build_notifier(settings: Settings) -> TelegramNotifier:
     return TelegramNotifier(
         bot_token=settings.telegram_bot_token,
@@ -51,7 +41,6 @@ def run_once(
     settings: Settings,
     *,
     topics: list[TopicConfig],
-    llm_client: LlmClient,
     notifier: TelegramNotifier,
 ) -> None:
     """Open a fresh connection and execute a single pipeline cycle."""
@@ -59,7 +48,6 @@ def run_once(
         Pipeline(
             settings=settings,
             repository=PostRepository(connection),
-            llm_client=llm_client,
             notifier=notifier,
             topics=topics,
         ).run_once()
@@ -69,13 +57,12 @@ def run_forever(
     settings: Settings,
     *,
     topics: list[TopicConfig],
-    llm_client: LlmClient,
     notifier: TelegramNotifier,
 ) -> None:
     """Poll forever; a failed cycle must never kill the worker (NFR-2)."""
     while True:
         try:
-            run_once(settings, topics=topics, llm_client=llm_client, notifier=notifier)
+            run_once(settings, topics=topics, notifier=notifier)
         except Exception:
             logger.exception("Pipeline cycle failed; retrying after the poll interval")
 
@@ -96,11 +83,10 @@ def main() -> None:
         settings.poll_interval_seconds,
     )
 
-    llm_client = build_llm_client(settings)
     notifier = build_notifier(settings)
 
     try:
-        run_forever(settings, topics=topics, llm_client=llm_client, notifier=notifier)
+        run_forever(settings, topics=topics, notifier=notifier)
     except KeyboardInterrupt:
         logger.info("Shutdown requested, exiting")
 

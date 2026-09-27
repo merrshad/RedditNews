@@ -13,7 +13,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app.models import AnalyzedPost, PostRecord, SimilarityCandidate
+from app.models import AnalyzedPost, PostRecord
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,8 @@ RETURNING id
 """
 
 _CANDIDATES_SQL = """
-SELECT id, reddit_id, title, summary_fa
+SELECT id, reddit_id, subreddit, source_topic_key, title, url, author,
+       topic, importance, summary_fa, key_points, published_at, status
 FROM posts
 WHERE summary_fa IS NOT NULL
   AND COALESCE(published_at, fetched_at) >= now() - make_interval(hours => %s)
@@ -76,13 +77,17 @@ class PostRepository:
             cursor.execute("SELECT 1 FROM posts WHERE reddit_id = %s", (reddit_id,))
             return cursor.fetchone() is not None
 
-    def get_similarity_candidates(self, *, limit: int, hours: int) -> list[SimilarityCandidate]:
-        """FR-4 / Invariant 10 — at most ``limit`` recently analysed posts."""
+    def get_similarity_candidates(self, *, limit: int, hours: int) -> list[PostRecord]:
+        """FR-4 / Invariant 10 — at most ``limit`` recently analysed posts.
+
+        Only the raw rows are returned; the presenter (``analyzer``) is responsible for
+        exposing just their 1-based position/title/summary to the LLM (Invariant 4).
+        """
         with self._connection.cursor() as cursor:
             cursor.execute(_CANDIDATES_SQL, (hours, limit))
             rows = cursor.fetchall()
 
-        candidates = [SimilarityCandidate.model_validate(row) for row in rows]
+        candidates = [PostRecord.model_validate(row) for row in rows]
         logger.debug("Loaded %d similarity candidate(s)", len(candidates))
         return candidates
 
