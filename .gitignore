@@ -1,0 +1,11 @@
+# Secrets (Invariant 6 — never commit real keys/tokens)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtualenvs
+.venv/
+venv/

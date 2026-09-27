@@ -114,6 +114,10 @@
 
 علاوه بر جریان بالا، **در ابتدای هر اجرا**، قبل از واکشی RSS جدید، سیستم پست‌های باقی‌مانده با `status = 'to_send'` از اجراهای قبلی (که تحلیل شده‌اند ولی ارسال‌شان به هر دلیلی کامل نشده) را دوباره تلاش می‌کند تا ارسال شوند (بازیابی پس از کرش — بخش ۷، Invariant شماره ۷).
 
+**مسیرهای خطا در مرحله ۴ (مهم برای Invariant ۳ و ۷):**
+- **خروجی LLM نامعتبر بود** (JSON ناقص، فیلد نامعتبر، `topic` خارج از فهرست مجاز، ایندکس کاندید خارج از محدوده): رکورد با `status='failed'` و در صورت وجود، `llm_raw_response` ذخیره می‌شود؛ هرگز به‌طور پیش‌فرض مرتبط/غیرتکراری فرض نمی‌شود (Invariant ۳).
+- **تماس LLM/شبکه شکست خورد** (بعد از اتمام `HTTP_MAX_RETRIES`): هیچ رکوردی نوشته نمی‌شود تا پست در دور بعدی دوباره واکشی و تحلیل شود؛ ثبت‌نکردن اینجا لازم است تا با `status='failed'` (که به معنی «خروجی نامعتبر» است) اشتباه نشود و پست از دست نرود (NFR-2، Invariant ۷).
+
 ### ۴.۲ چرا مراحل ۳ تا ۸ کاربر در یک تماس LLM ادغام شده‌اند
 
 کاربر پایپ‌لاین را در ۱۰ مرحله منطقی توضیح داده:
@@ -190,6 +194,7 @@
 | زبان | Python 3.11+ | خواسته صریح کاربر. |
 | دیتابیس | PostgreSQL (از طریق Docker) | خواسته صریح کاربر. |
 | RSS | `feedparser` | ساده‌ترین و پایدارترین کتابخانه پایتون برای RSS. |
+| خواندن فایل کانفیگ | `PyYAML` | تنها فایل کانفیگ غیر-env پروژه `config/topics.yaml` است؛ یک کتابخانه سبک برای خواندن آن کافی است (KISS). |
 | دسترسی به DB | `psycopg` (v3) با SQL خام، بدون ORM | یک جدول اصلی داریم؛ ORM/Migration framework (مثل Alembic) برای MVP اضافه‌بار غیرضروری است (YAGNI). Schema فقط در `db/schema.sql`. |
 | کلاینت LLM | کتابخانه رسمی `openai` (پشتیبانی از `base_url` سفارشی) | چون provider «OpenAI-compatible» است، از همان SDK استاندارد با `base_url`/`api_key`/`model` قابل‌تنظیم استفاده می‌شود؛ بدون قفل‌شدن روی یک vendor. |
 | اعتبارسنجی/تنظیمات | `pydantic` + `pydantic-settings` | اعتبارسنجی schema خروجی LLM (Invariant ۳) و خواندن config از env با type-safety. |
@@ -212,6 +217,8 @@ reddit-telegram-digest/
 ├── Dockerfile
 ├── requirements.txt
 ├── .env.example
+├── .gitignore                # جلوگیری از commit شدن .env و cacheها (Invariant 6)
+├── pytest.ini                # pythonpath = . تا `pytest` از ریشه پروژه کار کند (بخش ۱۳)
 ├── config/
 │   └── topics.yaml           # فهرست موضوعات مجاز + فیدهای RSS هر موضوع
 ├── db/
@@ -220,7 +227,7 @@ reddit-telegram-digest/
 │   ├── __init__.py
 │   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای پایپ‌لاین
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
-│   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
+│   ├── models.py              # مدل‌های Pydantic: RawPost, SimilarityCandidate, LlmAnalysis, AnalyzedPost, PostRecord
 │   ├── reddit_source.py       # واکشی/parse RSS  → FR-1
 │   ├── repository.py          # تمام پرس‌وجوهای DB → FR-2, FR-9, FR-11
 │   ├── llm_client.py          # wrapper نازک روی SDK OpenAI-compatible + retry
@@ -232,6 +239,7 @@ reddit-telegram-digest/
 │   ├── retry.py               # یوتیلیتی retry/backoff مشترک (DRY، NFR-2)
 │   └── pipeline.py            # orchestration: اتصال همه ماژول‌های بالا به هم
 └── tests/
+    ├── conftest.py             # fixtureهای مشترک (کانکشن/LLM جعلی؛ بدون شبکه واقعی)
     ├── test_reddit_source.py
     ├── test_repository.py
     ├── test_analyzer.py
@@ -272,7 +280,7 @@ CREATE TABLE IF NOT EXISTS posts (
     status              TEXT NOT NULL DEFAULT 'new'
                         CHECK (status IN (
                             'new', 'skipped_irrelevant', 'skipped_duplicate',
-                            'to_send', 'sent', 'failed'
+                            'skipped_low_importance', 'to_send', 'sent', 'failed'
                         )),
     sent_at             TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -285,6 +293,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_published_at  ON posts (published_at DESC);
 **نکات مهم درباره status:**
 - `new` → رکورد تازه (در عمل معمولاً خیلی کوتاه‌عمر است چون بلافاصله تحلیل می‌شود).
 - `skipped_irrelevant` / `skipped_duplicate` → تحلیل شده اما ارسال نمی‌شود؛ رکورد برای جلوگیری از پردازش مجدد نگه داشته می‌شود.
+- `skipped_low_importance` → پست مرتبط و غیرتکراری است، اما `importance` آن کمتر از `MIN_IMPORTANCE_TO_SEND` است (FR-10 شرط ج). عمداً از `skipped_irrelevant` جدا نگه داشته می‌شود تا وقتی آستانه سخت‌گیرانه‌تر می‌شود، پست‌های مرتبطِ کم‌اهمیت با پست‌های نامرتبط در دیتابیس قاطی نشوند.
 - `to_send` → تحلیل کامل شده، منتظر ارسال (یا ارسال قبلی ناموفق بوده و باید دوباره تلاش شود — FR-11).
 - `sent` → نهایی، موفق.
 - `failed` → خروجی LLM معتبر نبود یا خطای غیرقابل‌ریکاوری رخ داد؛ نیاز به بررسی دستی/لاگ دارد.
@@ -329,7 +338,7 @@ LOG_LEVEL=INFO
 | `SIMILARITY_LOOKBACK_LIMIT` | حداکثر تعداد پست کاندید برای تشخیص شباهت | 50 |
 | `SIMILARITY_LOOKBACK_HOURS` | بازه زمانی انتخاب کاندیدها | 72 |
 | `MIN_IMPORTANCE_TO_SEND` | حداقل اهمیت لازم برای ارسال (`low`/`medium`/`high`) | `low` |
-| `HTTP_MAX_RETRIES` | تعداد تلاش مجدد هر تماس خارجی | 3 |
+| `HTTP_MAX_RETRIES` | حداکثر تعداد تلاش کل هر تماس خارجی (شامل تلاش اول؛ backoff نمایی بین تلاش‌ها) | 3 |
 | `LOG_LEVEL` | سطح لاگ | `INFO` |
 
 فایل `config/topics.yaml` (نمونه — **فهرست واقعی باید توسط کاربر تکمیل شود**، بخش ۱۵):
@@ -439,3 +448,8 @@ pytest
 ## ۱۶. تاریخچه تصمیمات (Changelog)
 
 - **۲۰۲۶-۰۹-۲۸** — ایجاد اولیه سند. تصمیمات گرفته‌شده با کاربر: (۱) LLM از طریق API رایگان OpenAI-compatible، (۲) تشخیص شباهت به همان LLM سپرده شد (نه embedding)، (۳) ارسال تلگرام تک‌کاناله/broadcast بدون مدیریت مشترک. تصمیمات تکمیلی توسط Agent مطابق بخش ۳ مستند شد.
+- **۲۰۲۶-۰۹-۲۸** — پیاده‌سازی MVP طبق همین سند. سه تصمیم که در جریان پیاده‌سازی گرفته شد و سند با آن‌ها هم‌راستا شد:
+  1. **افزودن status جدید `skipped_low_importance`** (بخش ۱۰): سند قبلاً برای حالت «مرتبط و غیرتکراری اما زیر آستانه `MIN_IMPORTANCE_TO_SEND`» هیچ status‌ای نداشت و مجبور می‌شدیم آن را `skipped_irrelevant` بنامیم که داده را گمراه‌کننده می‌کرد. دلیل: FR-10 شرط (ج) با آستانه‌های `medium`/`high` هم باید قابل ردیابی باشد.
+  2. **شفاف‌سازی معنای `HTTP_MAX_RETRIES`** (بخش ۱۱): به‌جای «تعداد تلاش مجدد»، «حداکثر تعداد تلاش کل (شامل تلاش اول)» تعریف شد تا مرز تلاش‌ها قطعی و قابل تست باشد (Invariant 8).
+  3. **افزودن `PyYAML`** به stack (بخش ۸): `config/topics.yaml` بدون یک کتابخانه YAML قابل خواندن نیست.
+- **۲۰۲۶-۰۹-۲۸** — دو فایل کمکی به ساختار پروژه اضافه شد (بخش ۹): `.gitignore` (تا `.env` هرگز commit نشود — Invariant 6) و `pytest.ini` (تا `pytest` بدون نصب پکیج از ریشه پروژه کار کند، مطابق بخش ۱۳).

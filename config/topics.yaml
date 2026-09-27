@@ -1,0 +1,14 @@
+# The single source of allowed topics + their RSS feeds (AGENTS.md section 11).
+#
+# NOTE: the list below is the illustrative MVP sample. It must be replaced with
+# the real subreddit/search feeds before production use (AGENTS.md section 15).
+topics:
+  - key: ai
+    name: "هوش مصنوعی"
+    feeds:
+      - "https://www.reddit.com/r/MachineLearning/new/.rss"
+      - "https://www.reddit.com/r/artificial/new/.rss"
+  - key: startup
+    name: "استارتاپ"
+    feeds:
+      - "https://www.reddit.com/r/startups/new/.rss"
