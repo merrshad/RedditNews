@@ -12,7 +12,6 @@ import time
 from app.pipeline import Pipeline
 from app.reddit_source import TopicsConfig, load_topics_config
 from app.settings import Settings, get_settings
-from app.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -29,38 +28,19 @@ def setup_logging(level: str) -> None:
     )
 
 
-def build_notifier(settings: Settings) -> TelegramNotifier:
-    return TelegramNotifier(
-        bot_token=settings.telegram_bot_token,
-        chat_id=settings.telegram_chat_id,
-        max_retries=settings.http_max_retries,
-    )
-
-
-def run_once(
-    settings: Settings,
-    *,
-    topics_config: TopicsConfig,
-    notifier: TelegramNotifier,
-) -> None:
+def run_once(settings: Settings, *, topics_config: TopicsConfig) -> None:
     """Execute a single pipeline cycle (the repository opens its own connections)."""
     Pipeline(
         settings=settings,
-        notifier=notifier,
         topics_config=topics_config,
     ).run_once()
 
 
-def run_forever(
-    settings: Settings,
-    *,
-    topics_config: TopicsConfig,
-    notifier: TelegramNotifier,
-) -> None:
+def run_forever(settings: Settings, *, topics_config: TopicsConfig) -> None:
     """Poll forever; a failed cycle must never kill the worker (NFR-2)."""
     while True:
         try:
-            run_once(settings, topics_config=topics_config, notifier=notifier)
+            run_once(settings, topics_config=topics_config)
         except Exception:
             logger.exception("Pipeline cycle failed; retrying after the poll interval")
 
@@ -81,10 +61,8 @@ def main() -> None:
         settings.poll_interval_seconds,
     )
 
-    notifier = build_notifier(settings)
-
     try:
-        run_forever(settings, topics_config=topics_config, notifier=notifier)
+        run_forever(settings, topics_config=topics_config)
     except KeyboardInterrupt:
         logger.info("Shutdown requested, exiting")
 
