@@ -24,7 +24,7 @@ config/topics.yaml ─► reddit_source (RSS) ─► repository (بررسی تک
 cp .env.example .env
 # مقداردهی OPENAI_API_KEY, OPENAI_MODEL (و در صورت نیاز OPENAI_BASE_URL)،
 # TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID در .env
-# (اختیاری) تکمیل فهرست واقعی موضوعات/فیدها در config/topics.yaml
+# (اختیاری) افزودن ساب‌ردیت/موضوع بیشتر به config/topics.yaml
 
 docker compose up --build
 ```
