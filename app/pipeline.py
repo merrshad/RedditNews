@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 from app import repository
 from app.analyzer import AnalysisError, analyze
-from app.formatting import format_post_message
+from app.formatting import format_message
 from app.models import IMPORTANCE_ORDER, LlmAnalysis, PostRecord, PostStatus, RawPost
 from app.reddit_source import TopicsConfig, fetch_all, topic_display_names
 from app.settings import Settings
@@ -215,7 +215,7 @@ class Pipeline:
         if record.id is None:
             raise ValueError("refusing to send a post that was never stored (Invariant 2)")
 
-        text = format_post_message(record, topic_name=self._topic_label(record))
+        text = format_message(record, topic_name=self._topic_label(record))
         if not self._send_message(text):
             logger.error(
                 "Telegram rejected the message for reddit_id=%s; keeping status='to_send'",
