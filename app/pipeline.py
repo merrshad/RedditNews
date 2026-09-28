@@ -14,9 +14,8 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from app import repository
-from app.analyzer import LlmOutputError, analyze_post, load_system_prompt
+from app.analyzer import AnalysisError, analyze
 from app.formatting import format_post_message
-from app.llm_client import LlmClient
 from app.models import IMPORTANCE_ORDER, LlmAnalysis, PostRecord, PostStatus, RawPost
 from app.reddit_source import TopicsConfig, fetch_all, topic_display_names
 from app.settings import Settings
@@ -75,7 +74,7 @@ def build_post_record(
         topic=analysis.topic if analysis else None,
         importance=analysis.importance if analysis else None,
         summary_fa=analysis.summary_fa if analysis else None,
-        key_points=list(analysis.key_points_fa) if analysis else [],
+        key_points=list(analysis.key_points) if analysis else [],
         llm_raw_response=raw_response,
         status=status,
     )
@@ -88,18 +87,15 @@ class Pipeline:
         self,
         *,
         settings: Settings,
-        llm_client: LlmClient,
         notifier: TelegramNotifier,
         topics_config: TopicsConfig,
-        system_prompt: str | None = None,
     ) -> None:
         self._settings = settings
-        self._llm_client = llm_client
         self._notifier = notifier
         self._topics_config = topics_config
-        self._allowed_topics = [topic.key for topic in topics_config.topics]
-        self._topic_names = topic_display_names(topics_config.topics)
-        self._system_prompt = system_prompt if system_prompt is not None else load_system_prompt()
+        # The analyzer takes the topic objects themselves (key + Persian name).
+        self._topics = list(topics_config.topics)
+        self._topic_names = topic_display_names(self._topics)
 
     def run_once(self) -> None:
         """One full pipeline cycle; never raises for a single bad post/feed."""
@@ -144,14 +140,8 @@ class Pipeline:
         )
 
         try:
-            outcome = analyze_post(
-                post,
-                candidates,
-                llm_client=self._llm_client,
-                allowed_topics=self._allowed_topics,
-                system_prompt=self._system_prompt,
-            )
-        except LlmOutputError as exc:
+            analysis = analyze(post, candidates, self._topics)
+        except AnalysisError as exc:
             # Invariant 3: invalid output is recorded as failed, never assumed valid.
             logger.error("Invalid LLM output for reddit_id=%s: %s", post.reddit_id, exc)
             repository.save(
@@ -164,18 +154,19 @@ class Pipeline:
             logger.error("LLM call failed for reddit_id=%s: %s", post.reddit_id, exc)
             return
 
-        duplicate_of_id = self._resolve_duplicate(outcome.analysis, candidates)
+        duplicate_of_id = self._resolve_duplicate(analysis, candidates)
         status = determine_status(
-            outcome.analysis,
+            analysis,
             duplicate_of_id=duplicate_of_id,
             min_importance_to_send=self._settings.min_importance_to_send,
         )
         record = build_post_record(
             post,
             status=status,
-            analysis=outcome.analysis,
+            analysis=analysis,
             duplicate_of_id=duplicate_of_id,
-            raw_response=outcome.raw_response,
+            # FR-9/NFR-3: keep the validated analysis JSON for audit/debugging.
+            raw_response=analysis.model_dump(mode="json"),
         )
 
         # Invariant 2: store first, send only afterwards.

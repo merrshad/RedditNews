@@ -103,7 +103,7 @@
     llm_client.py           ورودی: پست جدید + کاندیدها + فهرست موضوعات مجاز
                             خروجی (JSON اعتبارسنجی‌شده با Pydantic):
                               is_relevant, duplicate_of_candidate_index,
-                              topic, importance, summary_fa, key_points_fa
+                              topic, importance, summary_fa, key_points
                             ▼
  ۵) repository.py      ── ذخیره رکورد کامل در جدول posts (همیشه، حتی اگر
                             نامرتبط/تکراری تشخیص داده شود) + تعیین status
@@ -147,8 +147,8 @@
 | FR-5 | تعیین موضوع | خروجی LLM شامل `topic` است که باید یکی از مقادیر تعریف‌شده در `config/topics.yaml` باشد. |
 | FR-6 | تعیین اهمیت | خروجی LLM شامل `importance` با یکی از سه مقدار `low` / `medium` / `high` است. |
 | FR-7 | تولید خلاصه فارسی | خروجی LLM شامل `summary_fa` است: خلاصه‌ای فارسی، مستقل از زبان پست اصلی. |
-| FR-8 | استخراج نکات مهم | خروجی LLM شامل `key_points_fa` است: آرایه‌ای از رشته‌های فارسی کوتاه (نکته‌به‌نکته). |
-| FR-9 | ذخیره در دیتابیس | نتیجه نهایی — چه پست مرتبط باشد چه نه — همیشه در جدول `posts` ذخیره می‌شود (برای جلوگیری از پردازش مجدد و برای audit). خروجی خام LLM هم در `llm_raw_response` نگه داشته می‌شود. |
+| FR-8 | استخراج نکات مهم | خروجی LLM شامل `key_points` است: آرایه‌ای از ۲ تا ۵ رشته‌ی فارسی کوتاه (نکته‌به‌نکته). |
+| FR-9 | ذخیره در دیتابیس | نتیجه نهایی — چه پست مرتبط باشد چه نه — همیشه در جدول `posts` ذخیره می‌شود (برای جلوگیری از پردازش مجدد و برای audit). خروجی تحلیل (JSON اعتبارسنجی‌شده با Pydantic) هم در `llm_raw_response` نگه داشته می‌شود. |
 | FR-10 | ارسال تلگرام | فقط پست‌هایی که `is_relevant = true`، `duplicate_of_id = null` و `importance >= MIN_IMPORTANCE_TO_SEND` باشند، به `TELEGRAM_CHAT_ID` ارسال می‌شوند. پیام شامل عنوان، subreddit، موضوع، اهمیت (فارسی)، خلاصه فارسی، نکات کلیدی (bullet) و لینک پست است. پس از ارسال موفق، `status='sent'` و `sent_at` ثبت می‌شود. |
 | FR-11 | بازیابی پس از کرش | در ابتدای هر اجرا، پیش از واکشی RSS جدید، پست‌های با `status='to_send'` باقی‌مانده از اجرای قبلی دوباره برای ارسال تلاش می‌شوند (بدون تحلیل مجدد با LLM). |
 
@@ -230,10 +230,10 @@ reddit-telegram-digest/
 │   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
 │   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
 │   ├── repository.py          # تمام پرس‌وجوهای DB؛ API: exists, save, update_status, fetch_recent_candidates, fetch_pending_to_send → FR-2, FR-4, FR-9, FR-11
-│   ├── llm_client.py          # wrapper نازک روی SDK OpenAI-compatible + retry
+│   ├── llm_client.py          # تنها تماس خام LLM: chat_completion() روی SDK OpenAI-compatible + retry
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
-│   ├── analyzer.py            # ساخت prompt، فراخوانی llm_client، اعتبارسنجی خروجی → FR-3..FR-8
+│   ├── analyzer.py            # ساخت prompt، فراخوانی chat_completion، اعتبارسنجی → analyze()/AnalysisError → FR-3..FR-8
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده → FR-10
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
@@ -456,3 +456,10 @@ pytest
   2. **شفاف‌سازی معنای `HTTP_MAX_RETRIES`** (بخش ۱۱): به‌جای «تعداد تلاش مجدد»، «حداکثر تعداد تلاش کل (شامل تلاش اول)» تعریف شد تا مرز تلاش‌ها قطعی و قابل تست باشد (Invariant 8).
   3. **افزودن `PyYAML`** به stack (بخش ۸): `config/topics.yaml` بدون یک کتابخانه YAML قابل خواندن نیست.
 - **۲۰۲۶-۰۹-۲۸** — دو فایل کمکی به ساختار پروژه اضافه شد (بخش ۹): `.gitignore` (تا `.env` هرگز commit نشود — Invariant 6) و `pytest.ini` (تا `pytest` بدون نصب پکیج از ریشه پروژه کار کند، مطابق بخش ۱۳).
+- **۲۰۲۶-۰۹-۲۸** — پیاده‌سازی مسیر «تحلیل LLM» (فاز ۲) و هم‌راستا کردن سند با آن:
+  1. **`llm_client` تک‌تابعی شد** (بخش ۹): به‌جای کلاس `LlmClient`، یک تابع ماژولی `chat_completion(system_prompt, user_prompt) -> str` که کلاینت را از `settings` می‌سازد و کل تماس را با `retry.py` می‌پوشاند.
+  2. **`analyze(post, candidates, allowed_topics) -> LlmAnalysis`** (بخش ۴.۱ و ۵): این امضا و خطای `AnalysisError` جای `analyze_post`/`LlmOutputError` را گرفت؛ تفسیر «این پست `failed` شود» به `pipeline.py` سپرده شد.
+  3. **تغییر نام `key_points_fa` → `key_points`** (بخش ۵، FR-8): همان نامی که از قبل در ستون JSONB و `PostRecord` استفاده می‌شد، تا یک نام در کل مسیر حاکم باشد.
+  4. **کاندیدهای شباهت از `SimilarityCandidate` به `PostRecord` تغییر کردند** (بخش ۹): مدل جداگانه حذف شد تا امضای `analyze` با داده‌ی واقعی جدول یکی باشد.
+  5. **`llm_raw_response` اکنون JSON اعتبارسنجی‌شده‌ی تحلیل را نگه می‌دارد** (بخش ۵، FR-9): چون `analyze` فقط `LlmAnalysis` برمی‌گرداند، خروجی خام در دسترس پایپ‌لاین نیست.
+  6. **`topic` در `LlmAnalysis` اجباری شد** (بخش ۵، FR-3/FR-5): خروجی LLM همیشه باید یکی از کلیدهای مجاز `config/topics.yaml` را برگرداند.
