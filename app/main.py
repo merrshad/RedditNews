@@ -1,11 +1,16 @@
 """Entry point: a simple periodic loop around one pipeline run (AGENTS.md section 8).
 
 No scheduler dependency on purpose (YAGNI): ``while True: run(); sleep(...)``.
+
+``SIGTERM`` is turned into the same ``KeyboardInterrupt`` path as Ctrl-C so that
+``docker stop`` leaves the worker cleanly instead of killing the process mid-cycle
+(NFR-2). Nothing here re-implements signal handling beyond that one seam.
 """
 
 from __future__ import annotations
 
 import logging
+import signal
 import sys
 import time
 
@@ -26,6 +31,28 @@ def setup_logging(level: str) -> None:
         stream=sys.stdout,
         force=True,
     )
+
+
+def _exit_on_sigterm(signum: int, frame: object) -> None:
+    """Raise ``KeyboardInterrupt`` so SIGTERM follows the existing shutdown path.
+
+    The repository writes are autocommit and one cycle is idempotent (Invariant 7),
+    so aborting a cycle mid-flight is safe: the next run simply picks the post up.
+    """
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    """Handle SIGTERM like Ctrl-C so ``docker stop`` exits the loop (NFR-2).
+
+    SIGINT already raises ``KeyboardInterrupt`` by default. Installing a handler is
+    only possible from the main thread, so a non-main-thread caller (some test
+    runners) is tolerated rather than fatal.
+    """
+    try:
+        signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    except ValueError:  # pragma: no cover - only reachable off the main thread
+        logger.warning("SIGTERM handler not installed: not running on the main thread")
 
 
 def run_once(settings: Settings, *, topics_config: TopicsConfig) -> None:
@@ -61,6 +88,7 @@ def main() -> None:
         settings.poll_interval_seconds,
     )
 
+    install_signal_handlers()
     try:
         run_forever(settings, topics_config=topics_config)
     except KeyboardInterrupt:

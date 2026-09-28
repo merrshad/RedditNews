@@ -1,12 +1,18 @@
-"""Pipeline tests: ordering, status decisions, idempotency and error isolation."""
+"""Pipeline tests: ordering, status decisions, idempotency and error isolation.
+
+The fast tests swap in an in-memory repository; the ``real storage`` section below
+keeps the repository real (Postgres) and proves the same six behaviours end to end.
+"""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
 
+from app import repository
 from app.models import LlmAnalysis, PostRecord, RawPost
 from app.pipeline import (
     Pipeline,
@@ -89,6 +95,18 @@ class FailingSender(FakeSender):
 
     def __init__(self) -> None:
         super().__init__(accept=False)
+
+
+class SequencedChatCompletion(FakeChatCompletion):
+    """Returns one answer per call, so a single run can mix valid and invalid output."""
+
+    def __init__(self, answers: list[str]) -> None:
+        super().__init__()
+        self._answers = list(answers)
+
+    def __call__(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append((system_prompt, user_prompt))
+        return self._answers.pop(0) if self._answers else ""
 
 
 def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
@@ -529,3 +547,227 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
     assert len(llm.calls) == 2  # never re-analysed
     assert len(working_sender.messages) == 2
     assert "خلاصه فارسی پست." in working_sender.messages[0]
+
+
+# --- real storage boundary: the six behaviours the phase-3 core must guarantee ----
+#
+# Same scenarios as above, but `app.repository` is *not* patched: only RSS, the LLM
+# transport and Telegram are faked, so every row really goes through `db/schema.sql`.
+
+
+def _row_for(connection: psycopg.Connection, reddit_id: str) -> dict:
+    """The stored row for one ``reddit_id`` (asserts it exists)."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT reddit_id, status, sent_at, is_relevant, duplicate_of_id, importance "
+            "FROM posts WHERE reddit_id = %s",
+            (reddit_id,),
+        )
+        row = cursor.fetchone()
+    assert row is not None, f"no stored row for reddit_id={reddit_id}"
+    return row
+
+
+def _insert_candidate(
+    connection: psycopg.Connection, *, post_id: int, reddit_id: str, published_at: datetime
+) -> None:
+    """Seed one analysed row so the real ``fetch_recent_candidates`` can find it.
+
+    The id is set explicitly so a mapping test can prove the 1-based index really was
+    translated into *that* row's id rather than the index value itself.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO posts (
+                id, reddit_id, subreddit, source_topic_key, title, url, published_at,
+                is_relevant, topic, importance, summary_fa, key_points, status
+            ) VALUES (
+                %s, %s, 'MachineLearning', 'ai', %s, %s, %s,
+                TRUE, 'ai', 'medium', %s, '[]'::jsonb, 'sent'
+            )
+            """,
+            (
+                post_id,
+                reddit_id,
+                f"Candidate {reddit_id}",
+                f"https://example.com/{reddit_id}",
+                published_at,
+                f"خلاصه {reddit_id}",
+            ),
+        )
+
+
+def _real_db_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    posts: list[RawPost],
+    answer: str | list[str] = json.dumps(VALID_ANSWER, ensure_ascii=False),
+    sender: FakeSender | None = None,
+) -> tuple[Pipeline, FakeSender, FakeChatCompletion]:
+    """A ``Pipeline`` over the real Postgres repository; only RSS/LLM/Telegram are faked."""
+    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: list(posts))
+    llm: FakeChatCompletion = (
+        SequencedChatCompletion(answer)
+        if isinstance(answer, list)
+        else FakeChatCompletion(answer)
+    )
+    _install_llm(monkeypatch, llm)
+    sender = sender if sender is not None else FakeSender()
+    pipeline = Pipeline(
+        settings=settings,
+        topics_config=topics_config,
+        send_message=sender,
+    )
+    return pipeline, sender, llm
+
+
+def test_real_db_sends_a_new_relevant_post_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """FR-9 + FR-10 — store, then send, and only once."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_new"
+    pipeline, sender, llm = _real_db_harness(
+        monkeypatch, settings=settings, topics_config=topics_config, posts=[_post(reddit_id)]
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "sent"
+    assert row["sent_at"] is not None
+    assert row["is_relevant"] is True
+    assert row["duplicate_of_id"] is None
+    assert len(llm.calls) == 1
+    assert len(sender.messages) == 1
+
+
+def test_real_db_a_second_run_does_not_reanalyse_or_resend(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 1 — the same feed item on the next poll costs no LLM call and no send."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_stored"
+    pipeline, sender, llm = _real_db_harness(
+        monkeypatch, settings=settings, topics_config=topics_config, posts=[_post(reddit_id)]
+    )
+
+    pipeline.run_once()
+    assert len(llm.calls) == 1
+
+    pipeline.run_once()  # the feed still returns the same reddit_id
+
+    assert len(llm.calls) == 1  # repository.exists() short-circuits before the LLM
+    assert len(sender.messages) == 1
+    assert len(repository.fetch_pending_to_send()) == 0
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "sent"
+
+
+def test_real_db_maps_a_duplicate_index_to_the_real_candidate_id(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 4 — candidate #2 becomes that row's id, never the number 2."""
+    now = datetime.now(timezone.utc)
+    first_id, second_id = 771001, 771002
+    _insert_candidate(
+        db_connection,
+        post_id=first_id,
+        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_a",
+        published_at=now - timedelta(hours=1),
+    )
+    _insert_candidate(
+        db_connection,
+        post_id=second_id,
+        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_b",
+        published_at=now - timedelta(hours=2),
+    )
+
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_dup"
+    pipeline, sender, _ = _real_db_harness(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        answer=json.dumps(
+            {**VALID_ANSWER, "duplicate_of_candidate_index": 2}, ensure_ascii=False
+        ),
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "skipped_duplicate"
+    assert row["duplicate_of_id"] == second_id
+    assert row["duplicate_of_id"] != 2
+    assert sender.messages == []
+
+
+def test_real_db_stores_a_low_importance_post_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """FR-10(c) — below ``MIN_IMPORTANCE_TO_SEND`` is kept, called out, and not sent."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_low"
+    pipeline, sender, _ = _real_db_harness(
+        monkeypatch,
+        settings=settings.model_copy(update={"min_importance_to_send": "medium"}),
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        answer=json.dumps({**VALID_ANSWER, "importance": "low"}, ensure_ascii=False),
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "skipped_low_importance"
+    assert row["is_relevant"] is True
+    assert row["importance"] == "low"
+    assert row["sent_at"] is None
+    assert sender.messages == []
+    assert repository.fetch_pending_to_send() == []  # nothing left for FR-11 either
+
+
+def test_real_db_records_failed_and_keeps_processing_the_next_post(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 3 + 8 — bad LLM output is stored as ``failed`` and never stops the run."""
+    broken = f"{TEST_REDDIT_ID_PREFIX}pipeline_broken"
+    fine = f"{TEST_REDDIT_ID_PREFIX}pipeline_fine"
+    pipeline, sender, llm = _real_db_harness(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(broken), _post(fine)],
+        answer=["sorry, no json", json.dumps(VALID_ANSWER, ensure_ascii=False)],
+    )
+
+    pipeline.run_once()
+
+    broken_row = _row_for(db_connection, broken)
+    assert broken_row["status"] == "failed"
+    assert broken_row["is_relevant"] is None
+    assert broken_row["sent_at"] is None
+
+    fine_row = _row_for(db_connection, fine)
+    assert fine_row["status"] == "sent"
+    assert fine_row["sent_at"] is not None
+
+    assert len(llm.calls) == 2
+    assert len(sender.messages) == 1
+    assert "خلاصه فارسی پست." in sender.messages[0]

@@ -225,7 +225,7 @@ reddit-telegram-digest/
 │   └── schema.sql            # تنها منبع تغییر schema (بخش ۱۰)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای پایپ‌لاین
+│   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای + خروج تمیز روی SIGTERM
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
 │   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
 │   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
@@ -245,7 +245,8 @@ reddit-telegram-digest/
     ├── test_analyzer.py
     ├── test_formatting.py
     ├── test_telegram_notifier.py
-    └── test_pipeline.py
+    ├── test_pipeline.py
+    └── test_main.py
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
@@ -253,6 +254,8 @@ reddit-telegram-digest/
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
 
 `telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` دیگر نوتيفایر نمی‌سازد و `Pipeline` فقط یک seam قابل‌تزریق با پیش‌فرض همین تابع دارد.
+
+`main.py` هم فقط یک حلقه است: هر چرخه یک `Pipeline` می‌سازد و `run_once()` را صدا می‌زند، خطای یک چرخه را لاگ می‌کند و اجازه نمی‌دهد worker بمیرد (NFR-2). همچنین یک handler برای `SIGTERM` نصب می‌کند که آن را به همان مسیر `KeyboardInterrupt` (Ctrl-C) تبدیل می‌کند تا `docker stop` تمیز خارج شود؛ چون `repository` با autocommit می‌نویسد و هر چرخه idempotent است (Invariant 7)، قطع‌شدن چرخه از وسط بی‌خطر است.
 
 ---
 
@@ -443,6 +446,7 @@ volumes:
 pip install -r requirements.txt
 pytest
 ```
+تست‌های دیتابیس (`tests/test_repository.py` و بخش «real storage» در `tests/test_pipeline.py`) integration هستند و روی یک Postgres واقعی اجرا می‌شوند؛ اگر دیتابیسی بالا نباشد، خودشان را با یک پیام روشن skip می‌کنند. برای اجرای کامل: `docker compose up -d db` و سپس `pytest`.
 
 ---
 
@@ -493,3 +497,8 @@ pytest
   4. **پیام بلندتر از ۴۰۹۶ کاراکتر فقط در سطح `WARNING` لاگ می‌شود و دست‌نخورده ارسال می‌شود**؛ کوتاه‌سازی همچنان مسئولیت `formatting.py` است (FR-10) — تفکیک مسئولیت‌ها حفظ شد.
   5. **retry روی تابع داخلی `_send_message_once`** با دکوریتور `retryable` اعمال می‌شود (نه روی `send_message`)، چون تنها همان لایه است که شکست را raise می‌کند تا backoff معنا داشته باشد؛ پیام‌های خطا همچنان پاک‌سازی‌شده‌اند تا توکن هرگز در لاگ نیفتد (Invariant 6، NFR-4).
   6. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — هسته یکپارچه‌سازی)** — تثبیت `app/pipeline.py` + `app/main.py` و هم‌راستا کردن سند با آن:
+  1. **خروج تمیز روی `SIGTERM`** (بخش ۹): `main.py` یک handler نصب می‌کند که `SIGTERM` را به همان مسیر `KeyboardInterrupt` (Ctrl-C) تبدیل می‌کند تا `docker stop` worker را وسط چرخه نکشد. دلیل: هر چرخه idempotent است و `repository` با autocommit می‌نویسد (Invariant 7)، پس قطع چرخه امن است؛ نصب handler فقط در main thread ممکن است، بنابراین `ValueError` تحمل می‌شود نه آنکه مرگبار باشد.
+  2. **شش رفتار فاز ۳ روی Postgres واقعی تست شدند** (بخش ۱۳): همان سناریوهایی که `tests/test_pipeline.py` قبلاً با repository درون‌حافظه‌ای پوشش می‌داد، حالا با `repository` واقعی هم اجرا می‌شوند — ذخیره‌قبل‌از‌ارسال و ارسال دقیقاً یک‌بار (FR-9/FR-10)، رد کردن پست موجود بدون تماس دوباره LLM (Invariant 1)، نگاشت ایندکس کاندید شماره ۲ به `id` واقعی همان ردیف و نه عدد ۲ (Invariant 4)، `skipped_low_importance` بدون ارسال (FR-10 شرط ج)، `failed` برای خروجی نامعتبر LLM بدون متوقف کردن بقیه پست‌ها (Invariant 3 و 8)، و بازیابی ارسال ناموفق در دور بعد (FR-11).
+  3. **افزودن `tests/test_main.py`** (بخش ۹): نصب شدن handler، تبدیل `SIGTERM` به `KeyboardInterrupt`، و زنده‌ماندن worker بعد از یک چرخهٔ خطادار (NFR-2) را تضمین می‌کند.
+  4. **هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است**: مقدار `status` موردنیاز این فاز (`skipped_low_importance`) از قبل طبق ردیف اول همین Changelog هم در `db/schema.sql` و هم در بخش ۱۰ وجود داشت (FR-10 شرط ج)، پس پیش‌نیاز این فاز چیزی برای اضافه‌کردن نداشت.
