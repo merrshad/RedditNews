@@ -2,95 +2,134 @@
 
 Pure functions only — no I/O, so this module is trivially unit-testable (NFR-8).
 Invariant 5: everything shown to the reader is Persian, regardless of the post
-language.
+language. The exact layout is documented in AGENTS.md section 12, and this module is
+also the single place that guarantees the message fits Telegram's length limit (FR-10).
 """
 
 from __future__ import annotations
 
+from html import escape as html_escape
+
 from app.models import PostRecord
 
-# Telegram's hard limit is 4096 characters; stay below it to leave room for the
-# truncation suffix and for Telegram's own entity handling.
+# Telegram's hard limit for the text of one message.
 TELEGRAM_MESSAGE_LIMIT = 4096
-SAFE_MESSAGE_LIMIT = 4000
 
-MAX_TITLE_CHARS = 300
-MAX_SUMMARY_CHARS = 1500
-MAX_KEY_POINT_CHARS = 300
-
-TRUNCATION_SUFFIX = "…"
-
+# Importance -> Persian label for the reader, plus the fallback for a missing value.
 IMPORTANCE_LABELS_FA: dict[str, str] = {
     "low": "کم",
     "medium": "متوسط",
-    "high": "زیاد",
+    "high": "بالا",
 }
 UNKNOWN_TOPIC_LABEL = "نامشخص"
+UNKNOWN_IMPORTANCE_LABEL = "نامشخص"
 MISSING_SUMMARY_LABEL = "خلاصه‌ای برای این پست ثبت نشده است."
+
+KEY_POINTS_HEADING = "🔑 نکات کلیدی:"
+LINK_PREFIX = "🔗 "
+
+TRUNCATION_SUFFIX = "…"
 
 
 def escape_html(text: str) -> str:
-    """Escape the three characters Telegram's HTML parse mode cares about."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Escape the three characters Telegram's HTML parse mode cares about.
+
+    ``quote=False`` leaves ``"`` and ``'`` readable: the text never ends up inside an
+    HTML attribute, so escaping them would only make the message uglier.
+    """
+    return html_escape(text, quote=False)
 
 
 def importance_label(importance: str | None) -> str:
-    """Persian label for the importance value (FR-10)."""
-    return IMPORTANCE_LABELS_FA.get((importance or "").lower(), IMPORTANCE_LABELS_FA["low"])
+    """Persian label for an importance value; ``نامشخص`` when it is absent (FR-10)."""
+    return IMPORTANCE_LABELS_FA.get(
+        (importance or "").strip().lower(), UNKNOWN_IMPORTANCE_LABEL
+    )
 
 
 def truncate(text: str, limit: int) -> str:
-    """Cut ``text`` to ``limit`` characters, marking the cut with an ellipsis."""
+    """Cut ``text`` down to at most ``limit`` characters, marking the cut with ``…``."""
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
-    return text[: max(limit - len(TRUNCATION_SUFFIX), 0)].rstrip() + TRUNCATION_SUFFIX
+    return text[: limit - len(TRUNCATION_SUFFIX)].rstrip() + TRUNCATION_SUFFIX
 
 
-def _format_header(post: PostRecord, topic_name: str | None) -> str:
-    lines = [
-        f"<b>{escape_html(truncate(post.title, MAX_TITLE_CHARS))}</b>",
-        f"📌 سابردیت: r/{escape_html(post.subreddit)}",
-        f"🗂 موضوع: {escape_html(topic_name or post.topic or UNKNOWN_TOPIC_LABEL)}",
-        f"⭐ اهمیت: {escape_html(importance_label(post.importance))}",
-    ]
-    return "\n".join(lines)
+def _topic_label(post: PostRecord, topic_name: str | None) -> str:
+    """Persian name when the caller resolved one, otherwise the stored topic key."""
+    return topic_name or post.topic or UNKNOWN_TOPIC_LABEL
 
 
-def _format_summary(post: PostRecord) -> str:
-    summary = truncate(
-        escape_html((post.summary_fa or "").strip()) or MISSING_SUMMARY_LABEL,
-        MAX_SUMMARY_CHARS,
+def _header(post: PostRecord, topic_name: str | None) -> str:
+    """The title plus the single metadata row (FR-10)."""
+    title = escape_html(post.title)
+    meta = (
+        f"r/{escape_html(post.subreddit)}"
+        f" • {escape_html(_topic_label(post, topic_name))}"
+        f" • اهمیت: {escape_html(importance_label(post.importance))}"
     )
-    return f"📝 خلاصه:\n{summary}"
+    return f"📌 <b>{title}</b>\n{meta}"
 
 
-def _format_key_points(post: PostRecord) -> str:
+def _summary(post: PostRecord) -> str:
+    return escape_html((post.summary_fa or "").strip()) or MISSING_SUMMARY_LABEL
+
+
+def _key_points(post: PostRecord) -> str:
     points = [point.strip() for point in (post.key_points or []) if point and point.strip()]
     if not points:
         return ""
-    bullets = "\n".join(
-        f"• {escape_html(truncate(point, MAX_KEY_POINT_CHARS))}" for point in points
-    )
-    return f"🔑 نکات کلیدی:\n{bullets}"
+    bullets = "\n".join(f"• {escape_html(point)}" for point in points)
+    return f"{KEY_POINTS_HEADING}\n{bullets}"
 
 
-def _format_link(post: PostRecord) -> str:
-    # Quotes are stripped so the URL can never break out of the href attribute.
-    href = escape_html(post.url.replace('"', "%22").replace("'", "%27"))
-    return f'🔗 <a href="{href}">مشاهده پست اصلی</a>'
+def _link(post: PostRecord) -> str:
+    return f"{LINK_PREFIX}{escape_html(post.url)}"
 
 
-def format_post_message(post: PostRecord, *, topic_name: str | None = None) -> str:
-    """Render the full Persian Telegram message for a post (FR-10)."""
+def _render(post: PostRecord, topic_name: str | None, summary: str) -> str:
     sections = [
-        _format_header(post, topic_name),
-        _format_summary(post),
-        _format_key_points(post),
-        _format_link(post),
+        _header(post, topic_name),
+        summary,
+        _key_points(post),
+        _link(post),
     ]
-    message = "\n\n".join(section for section in sections if section)
+    return "\n\n".join(section for section in sections if section)
 
-    # Safety net for pathological inputs: always stay inside Telegram's limit.
-    if len(message) > SAFE_MESSAGE_LIMIT:
-        message = truncate(message, SAFE_MESSAGE_LIMIT)
-    return message
+
+def format_message(post: PostRecord, *, topic_name: str | None = None) -> str:
+    """Render the Persian Telegram message for one stored post (FR-10).
+
+    ``topic_name`` is the Persian display name resolved from ``config/topics.yaml``
+    (``pipeline`` already has the mapping); when a caller has none, the stored topic key
+    is shown instead of a raw English key leaking into the message. The layout:
+
+        📌 <b>{title}</b>
+        r/{subreddit} • {topic} • اهمیت: {importance_fa}
+
+        {summary_fa}
+
+        🔑 نکات کلیدی:
+        • {key_point}
+
+        🔗 {url}
+
+    The result always fits Telegram's ``TELEGRAM_MESSAGE_LIMIT``: the summary is the
+    only unbounded, non-essential section, so it is shortened first; the final hard cut
+    only covers the pathological case where the fixed sections alone are already too
+    long (e.g. a list of enormous key points).
+    """
+    message = _render(post, topic_name, _summary(post))
+    if len(message) <= TELEGRAM_MESSAGE_LIMIT:
+        return message
+
+    # Shorten the summary by exactly the overflow; truncate() also adds the "…".
+    summary = _summary(post)
+    room = len(summary) - (len(message) - TELEGRAM_MESSAGE_LIMIT)
+    message = _render(post, topic_name, truncate(summary, room))
+    if len(message) <= TELEGRAM_MESSAGE_LIMIT:
+        return message
+
+    # The fixed sections do not fit on their own, so cut the whole message.
+    return truncate(message, TELEGRAM_MESSAGE_LIMIT)

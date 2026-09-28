@@ -445,11 +445,11 @@ def test_run_once_wires_real_modules_end_to_end(
     assert stored.key_points == ["نکته اول"]
 
     message = notifier.messages[0]
-    assert "A new open model was released" in message
-    assert "🗂 موضوع: هوش مصنوعی" in message
-    assert "⭐ اهمیت: زیاد" in message
+    assert "📌 <b>A new open model was released</b>" in message
+    assert "r/MachineLearning • هوش مصنوعی • اهمیت: بالا" in message
     assert "خلاصه فارسی پست." in message
-    assert message.endswith("مشاهده پست اصلی</a>")
+    assert "• نکته اول" in message
+    assert message.endswith(f"🔗 {_post().url}")
 
 
 def test_resolve_duplicate_ignores_an_out_of_range_index(

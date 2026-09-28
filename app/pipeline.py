@@ -15,7 +15,7 @@ from typing import Any, Sequence
 
 from app import repository
 from app.analyzer import AnalysisError, analyze
-from app.formatting import format_post_message
+from app.formatting import format_message
 from app.models import IMPORTANCE_ORDER, LlmAnalysis, PostRecord, PostStatus, RawPost
 from app.reddit_source import TopicsConfig, fetch_all, topic_display_names
 from app.settings import Settings
@@ -204,6 +204,6 @@ class Pipeline:
             raise ValueError("refusing to send a post that was never stored (Invariant 2)")
 
         self._notifier.send_message(
-            format_post_message(record, topic_name=self._topic_label(record))
+            format_message(record, topic_name=self._topic_label(record))
         )
         repository.update_status(record.id, "sent", datetime.now(timezone.utc))
