@@ -19,8 +19,8 @@ from app.settings import Settings
 from app.telegram_notifier import TelegramError
 from tests.conftest import (
     TEST_REDDIT_ID_PREFIX,
+    FakeChatCompletion,
     FakeRepository,
-    StubLlmClient,
     patch_repository,
 )
 
@@ -30,7 +30,7 @@ VALID_ANSWER = {
     "topic": "ai",
     "importance": "high",
     "summary_fa": "خلاصه فارسی پست.",
-    "key_points_fa": ["نکته اول"],
+    "key_points": ["نکته اول"],
 }
 
 
@@ -79,6 +79,25 @@ class FailingNotifier(FakeNotifier):
         raise TelegramError("sendMessage rejected")
 
 
+def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
+    """A ``chat_completion`` stand-in for the "the provider is down" path."""
+    raise RuntimeError("provider down")
+
+
+def _install_llm(
+    monkeypatch: pytest.MonkeyPatch, llm: FakeChatCompletion
+) -> FakeChatCompletion:
+    """Point ``app.analyzer.chat_completion`` at a fake transport (NFR-8: no network)."""
+    monkeypatch.setattr("app.analyzer.chat_completion", llm)
+    return llm
+
+
+@pytest.fixture
+def llm(monkeypatch: pytest.MonkeyPatch) -> FakeChatCompletion:
+    """The fake LLM transport, exposed so a test can assert how often it was called."""
+    return _install_llm(monkeypatch, FakeChatCompletion())
+
+
 def _harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -87,17 +106,18 @@ def _harness(
     repository: FakeRepository | None = None,
     answer: str = json.dumps(VALID_ANSWER, ensure_ascii=False),
     notifier: FakeNotifier | None = None,
-    llm_client: object | None = None,
+    llm: FakeChatCompletion | None = None,
 ) -> tuple[Pipeline, FakeRepository, FakeNotifier]:
-    """A pipeline wired to an in-memory storage fake and a stubbed LLM."""
+    """A pipeline wired to an in-memory storage fake and a stubbed LLM transport."""
+    llm = llm if llm is not None else FakeChatCompletion()
+    llm.answer = answer
+    _install_llm(monkeypatch, llm)
     repository = patch_repository(monkeypatch, repository or FakeRepository())
     notifier = notifier if notifier is not None else FakeNotifier()
     pipeline = Pipeline(
         settings=settings,
-        llm_client=llm_client if llm_client is not None else StubLlmClient(answer),  # type: ignore[arg-type]
         notifier=notifier,  # type: ignore[arg-type]
         topics_config=topics_config,
-        system_prompt="SYSTEM",
     )
     return pipeline, repository, notifier
 
@@ -130,7 +150,7 @@ def test_meets_importance_threshold(importance: str | None, minimum: str, expect
 def test_determine_status_covers_every_outcome() -> None:
     relevant = LlmAnalysis.model_validate(VALID_ANSWER)
     irrelevant = LlmAnalysis.model_validate(
-        {**VALID_ANSWER, "is_relevant": False, "topic": None, "summary_fa": ""}
+        {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""}
     )
     low_importance = LlmAnalysis.model_validate({**VALID_ANSWER, "importance": "low"})
 
@@ -188,7 +208,7 @@ def test_run_once_stores_irrelevant_posts_without_sending(
         settings=settings,
         topics_config=topics_config,
         answer=json.dumps(
-            {**VALID_ANSWER, "is_relevant": False, "topic": None, "summary_fa": ""},
+            {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""},
             ensure_ascii=False,
         ),
     )
@@ -237,7 +257,10 @@ def test_run_once_sends_a_qualifying_post_only_after_storing_it(
     pipeline.run_once()
 
     assert repository.saved[0].status == "to_send"
-    assert repository.saved[0].llm_raw_response is not None
+    # FR-9/NFR-3: the validated analysis JSON is kept for audit.
+    assert repository.saved[0].llm_raw_response == LlmAnalysis.model_validate(
+        VALID_ANSWER
+    ).model_dump(mode="json")
     assert repository.sent_ids == [repository.last_id]
     assert len(notifier.messages) == 1
     assert "خلاصه فارسی پست." in notifier.messages[0]
@@ -290,15 +313,12 @@ def test_run_once_records_failed_status_for_invalid_llm_output(
 def test_run_once_leaves_the_post_unstored_when_the_llm_call_itself_fails(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    class FailingLlmClient:
-        def complete(self, *, system_prompt: str, user_prompt: str) -> str:
-            raise RuntimeError("provider down")
-
-    pipeline, repository, _ = _harness(
-        monkeypatch,
+    monkeypatch.setattr("app.analyzer.chat_completion", _raise_runtime_error)
+    repository = patch_repository(monkeypatch, FakeRepository())
+    pipeline = Pipeline(
         settings=settings,
+        notifier=FakeNotifier(),  # type: ignore[arg-type]
         topics_config=topics_config,
-        llm_client=FailingLlmClient(),
     )
 
     pipeline.run_once()
@@ -325,7 +345,10 @@ def test_run_once_keeps_processing_after_one_post_fails(
 
 
 def test_run_once_retries_pending_sends_without_re_analysing(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    llm: FakeChatCompletion,
 ) -> None:
     fetched: list[str] = []
     monkeypatch.setattr(
@@ -336,6 +359,7 @@ def test_run_once_retries_pending_sends_without_re_analysing(
         settings=settings,
         topics_config=topics_config,
         repository=FakeRepository(pending=(_pending(5),)),
+        llm=llm,
     )
 
     pipeline.run_once()
@@ -344,6 +368,7 @@ def test_run_once_retries_pending_sends_without_re_analysing(
     assert "خلاصه پست معلق." in notifier.messages[0]
     assert repository.calls.index("fetch_pending_to_send") < repository.calls.index("update_status")
     assert fetched == ["fetch"]
+    assert llm.calls == []  # FR-11: no second LLM call
 
 
 def test_run_once_keeps_a_failed_send_as_to_send(
@@ -456,15 +481,15 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
     feed = SAMPLE_FEED.replace("t3_1abcde", reddit_id).replace("t3_2fghij", f"{reddit_id}_two")
     monkeypatch.setattr("app.pipeline.fetch_all", real_fetch_all)
     monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: feed.encode("utf-8"))
-    llm_client = StubLlmClient(json.dumps(VALID_ANSWER, ensure_ascii=False))
+    llm = _install_llm(
+        monkeypatch, FakeChatCompletion(json.dumps(VALID_ANSWER, ensure_ascii=False))
+    )
 
     def build(notifier: FakeNotifier) -> Pipeline:
         return Pipeline(
             settings=settings,
-            llm_client=llm_client,  # type: ignore[arg-type]
             notifier=notifier,  # type: ignore[arg-type]
             topics_config=topics_config,
-            system_prompt="SYSTEM",
         )
 
     def stored_rows() -> list[dict]:
@@ -481,7 +506,7 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
 
     assert [row["status"] for row in stored_rows()] == ["to_send", "to_send"]
     assert all(row["sent_at"] is None for row in stored_rows())
-    assert len(llm_client.calls) == 2  # one LLM call per fetched post
+    assert len(llm.calls) == 2  # one LLM call per fetched post
 
     # Second run: no new RSS items, so only the pending rows are retried (FR-11).
     monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [])
@@ -490,6 +515,6 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
 
     assert [row["status"] for row in stored_rows()] == ["sent", "sent"]
     assert all(row["sent_at"] is not None for row in stored_rows())
-    assert len(llm_client.calls) == 2  # never re-analysed
+    assert len(llm.calls) == 2  # never re-analysed
     assert len(working_notifier.messages) == 2
     assert "خلاصه فارسی پست." in working_notifier.messages[0]

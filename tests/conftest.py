@@ -49,14 +49,14 @@ _REPOSITORY_API = (
 )
 
 
-class StubLlmClient:
-    """Records the prompts it receives and replays a canned answer."""
+class FakeChatCompletion:
+    """Stand-in for ``app.analyzer.chat_completion``: records prompts, replays an answer."""
 
-    def __init__(self, answer: str) -> None:
+    def __init__(self, answer: str = "") -> None:
         self.answer = answer
         self.calls: list[tuple[str, str]] = []
 
-    def complete(self, *, system_prompt: str, user_prompt: str) -> str:
+    def __call__(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         return self.answer
 
