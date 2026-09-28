@@ -97,17 +97,44 @@ def test_send_message_returns_true_and_posts_the_expected_payload(http: FakeHttp
 # --- ordinary failures become False, never an exception ---------------------------
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 404, 429, 500, 502])
+@pytest.mark.parametrize("status_code", [429, 500, 502])
 def test_send_message_returns_false_after_retries_when_telegram_rejects(
     http: FakeHttp, status_code: int
 ) -> None:
     http.default = FakeResponse(
-        status_code=status_code, body={"ok": False, "description": "Bad Request: chat not found"}
+        status_code=status_code, body={"ok": False, "description": "Too Many Requests"}
     )
 
     # No exception may escape: the pipeline decides 'sent' vs keep for the next run.
     assert telegram_notifier.send_message(MESSAGE_TEXT) is False
-    assert http.attempts == 3  # HTTP_MAX_RETRIES
+    assert http.attempts == 3  # HTTP_MAX_RETRIES: throttling and 5xx may pass later
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+def test_a_rejected_request_is_not_retried(http: FakeHttp, status_code: int) -> None:
+    """A bad token/chat/HTML fails identically every time, so the budget is not spent.
+
+    Measured in a real phase-4 run: retrying a rejected token cost ~3.3s per post, about
+    80 seconds of a 25-post cycle, on every cycle.
+    """
+    http.default = FakeResponse(
+        status_code=status_code, body={"ok": False, "description": "Bad Request: chat not found"}
+    )
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert http.attempts == 1
+
+
+def test_a_rejected_request_is_logged_as_permanent(http: FakeHttp, caplog) -> None:
+    """The operator must be able to tell a bad token apart from a flaky network."""
+    http.default = FakeResponse(
+        status_code=401, body={"ok": False, "description": "Unauthorized"}
+    )
+
+    with caplog.at_level(logging.ERROR):
+        assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+
+    assert "failed permanently" in caplog.text
 
 
 def test_send_message_returns_false_when_the_body_reports_not_ok(http: FakeHttp) -> None:

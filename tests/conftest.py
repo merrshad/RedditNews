@@ -4,6 +4,12 @@ Unit tests never touch the network (RSS/LLM/Telegram are faked, NFR-8). The data
 tests are integration tests against a real Postgres (`docker compose up -d db`); when
 no database is reachable they skip themselves with a clear message, so a plain
 `pytest` still works on a machine without Docker.
+
+The database tests own a *separate* database (`<DATABASE_URL>_test`, created on demand).
+They used to run against the configured one, which meant a real `docker compose up` run —
+which is exactly what phase 4 asks for — wrote analysed posts into the same `posts` table
+and broke five candidate/duplicate tests (observed). Isolating the two is what keeps
+`pytest` green while a real worker is running against the development database.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import os
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 import pytest
@@ -40,6 +47,31 @@ SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 # without touching anything else in the database.
 TEST_REDDIT_ID_PREFIX = "t3_test_"
 
+# Name suffix of the database the integration tests use, and its URL.
+TEST_DATABASE_SUFFIX = "_test"
+
+
+def _with_test_suffix(url: str) -> str:
+    """`postgresql://.../reddit_digest` -> `postgresql://.../reddit_digest_test`.
+
+    Idempotent on purpose: pytest imports this file once as ``conftest`` and once as
+    ``tests.conftest`` (the test modules import helpers from it by name), so the suffix
+    must not be appended twice.
+    """
+    parts = urlsplit(url)
+    if parts.path.endswith(TEST_DATABASE_SUFFIX):
+        return url
+    return urlunsplit(parts._replace(path=f"{parts.path}{TEST_DATABASE_SUFFIX}"))
+
+
+TEST_DATABASE_URL = _with_test_suffix(DATABASE_URL)
+
+# `app.repository` and `app.settings` read this env var directly, so pointing the process
+# at the test database is what makes every DB test — and every real `repository` call the
+# pipeline makes — land there instead of in the development database. Set (not
+# `setdefault`): the tests must never run against the database a real worker writes to.
+os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+
 _REPOSITORY_API = (
     "exists",
     "save",
@@ -59,6 +91,36 @@ class FakeChatCompletion:
     def __call__(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         return self.answer
+
+
+class FakeSender:
+    """Stand-in for ``app.telegram_notifier.send_message`` (NFR-8: no network).
+
+    It mirrors the real contract — text in, ``True`` only when Telegram accepted the
+    message — so a rejected send comes back as ``False`` and the pipeline keeps the record
+    as ``to_send`` for the next run (FR-10/FR-11).
+    """
+
+    def __init__(self, *, accept: bool = True, fail_first: bool = False) -> None:
+        self.accept = accept
+        self.fail_first = fail_first
+        self.messages: list[str] = []
+
+    def __call__(self, text: str) -> bool:
+        if self.fail_first:
+            self.fail_first = False
+            return False
+        if not self.accept:
+            return False
+        self.messages.append(text)
+        return True
+
+
+class FailingSender(FakeSender):
+    """A notifier that always reports a rejected send (Telegram is down)."""
+
+    def __init__(self) -> None:
+        super().__init__(accept=False)
 
 
 class FakeRepository:
@@ -139,7 +201,7 @@ def _fresh_settings_cache() -> Iterator[None]:
 def settings() -> Settings:
     """Explicit settings so tests never depend on the developer's env/.env."""
     return Settings(
-        database_url=DATABASE_URL,
+        database_url=TEST_DATABASE_URL,
         openai_api_key="test-key",
         openai_base_url="https://llm.example/v1",
         openai_model="test-model",
@@ -178,8 +240,24 @@ def apply_schema() -> None:
     The container applies it on first boot too; running it again is idempotent and
     keeps the tests working against any fresh Postgres.
     """
-    with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as connection:
         connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def create_test_database() -> None:
+    """Create ``<DATABASE_URL>_test`` if it does not exist yet.
+
+    Connects to the configured (development) database first: that one is guaranteed to
+    exist, and ``CREATE DATABASE`` cannot run inside a transaction, hence autocommit. The
+    name comes from configuration, never from user input, and is quoted defensively.
+    """
+    name = urlsplit(TEST_DATABASE_URL).path.lstrip("/")
+    with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (name,)
+        ).fetchone()
+        if exists is None:
+            connection.execute(f'CREATE DATABASE "{name}"')
 
 
 def delete_test_rows(connection: psycopg.Connection) -> None:
@@ -196,12 +274,15 @@ def delete_test_rows(connection: psycopg.Connection) -> None:
 
 @pytest.fixture(scope="session")
 def postgres_database() -> str:
-    """URL of the Postgres under test, or a skip when none is reachable."""
+    """URL of the isolated Postgres under test, or a skip when none is reachable."""
     try:
+        create_test_database()
         apply_schema()
     except psycopg.OperationalError as exc:
-        pytest.skip(f"no Postgres at {DATABASE_URL} ({exc}); start it with `docker compose up -d db`")
-    return DATABASE_URL
+        pytest.skip(
+            f"no Postgres at {DATABASE_URL} ({exc}); start it with `docker compose up -d db`"
+        )
+    return TEST_DATABASE_URL
 
 
 @pytest.fixture

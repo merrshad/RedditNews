@@ -19,15 +19,23 @@ logger = logging.getLogger(__name__)
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
+# Transport libraries log every request, and their messages carry the credentials: httpx
+# prints the full URL, which for Telegram is `.../bot<TOKEN>/sendMessage`, and at DEBUG it
+# prints the headers, which hold the LLM bearer key. A real phase-4 run showed the bot
+# token in `docker logs` at the default INFO level, so these loggers stay at WARNING no
+# matter what LOG_LEVEL asks for (Invariant 6, NFR-4).
+SECRET_BEARING_LOGGERS = ("httpx", "httpcore", "openai")
+
 
 def setup_logging(level: str) -> None:
     """Structured-enough logging to stdout, which Docker collects (NFR-3)."""
-    logging.basicConfig(
-        level=level.upper(),
-        format=LOG_FORMAT,
-        stream=sys.stdout,
-        force=True,
-    )
+    name = level.upper()
+    logging.basicConfig(level=name, format=LOG_FORMAT, stream=sys.stdout, force=True)
+
+    # `LOG_LEVEL=DEBUG` still must not print a token, so the transport loggers are capped.
+    requested = logging.getLevelNamesMapping().get(name, logging.INFO)
+    for logger_name in SECRET_BEARING_LOGGERS:
+        logging.getLogger(logger_name).setLevel(max(requested, logging.WARNING))
 
 
 def _request_shutdown(_signum: int, _frame: object) -> None:

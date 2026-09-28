@@ -236,20 +236,26 @@ reddit-telegram-digest/
 │   ├── analyzer.py            # ساخت prompt، فراخوانی chat_completion، اعتبارسنجی → analyze()/AnalysisError → FR-3..FR-8
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
-│   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
+│   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن + `PermanentError` (DRY، NFR-2)
 │   └── pipeline.py            # orchestration؛ API: run_once, retry_pending_sends → FR-1..FR-11
 └── tests/
-    ├── conftest.py             # fixtureهای مشترک (جایگزین in-memory برای repository، LLM جعلی، کانکشن واقعی برای تست‌های DB)
+    ├── conftest.py             # fixtureهای مشترک (repository درون‌حافظه، LLM/Telegram جعلی، کانکشن واقعی) + دیتابیس اختصاصی تست
+    ├── fixtures/
+    │   └── reddit_learnmachinelearning.rss   # نمونهٔ واقعی (capture) از یک فید Atom ریدیت برای تست parser
     ├── test_reddit_source.py
     ├── test_repository.py
     ├── test_analyzer.py
     ├── test_formatting.py
     ├── test_telegram_notifier.py
+    ├── test_llm_client.py
     ├── test_main.py
-    └── test_pipeline.py
+    ├── test_pipeline.py
+    └── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴)
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
+
+تست‌های دیتابیسی روی یک دیتابیس **جداگانه** (`<DATABASE_URL>_test`) اجرا می‌شوند که `conftest.py` خودش می‌سازد و `db/schema.sql` را روی آن اعمال می‌کند — تا یک اجرای واقعی `docker compose up` که رکورد در دیتابیس توسعه می‌نویسد، نتیجهٔ تست‌ها را عوض نکند.
 
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
 
@@ -371,9 +377,11 @@ topics:
 - **YAGNI**: هیچ قابلیتی «برای آینده» اضافه نشود مگر در بخش ۲ (در دامنه) ذکر شده باشد. اگر Agent فکر می‌کند چیزی لازم است ولی در این سند نیست، باید طبق قانون بخش ۱۴ عمل کند (اول مستند، بعد کد؛ یا سوال از کاربر).
 - **جداسازی مسئولیت‌ها**: هیچ ماژولی نباید هم‌زمان I/O خارجی و منطق تصمیم‌گیری را قاطی کند. مثلاً `analyzer.py` منطق ساخت prompt و تفسیر خروجی را دارد، اما تماس HTTP خام در `llm_client.py` است.
 - **خطا و Retry**: تمام تماس‌های خارجی (RSS، LLM، Telegram) با دکوریتور `retryable` از `retry.py` پوشش داده می‌شوند (تلاش محدود با backoff نمایی، سقف از `HTTP_MAX_RETRIES`). خطای یک پست فقط همان پست را `failed` می‌کند و اجرای بقیه ادامه دارد.
+- **فقط خطاهای گذرا retry می‌شوند**: status‌های 4xx (به‌جز 429) یعنی «درخواست خودش غلط است» (توکن/کلید نامعتبر، چت ناشناس، فید ۴۰۴) و در تلاش بعدی هم همان جواب را می‌گیرند؛ چنین مواردی باید `PermanentError` از `retry.py` را raise کنند تا موتور retry فوراً بالا برود و بودجهٔ تلاش و sleepهای backoff هدر نرود. برای 429 انتظار `Retry-After` (با سقف `MAX_RETRY_AFTER_SECONDS` در `reddit_source.py`) رعایت می‌شود.
+- **خطای دائمی در سطح APIهای عمومی هم بدون تغییر رفتار دیده شود**: `telegram_notifier.send_message` همچنان `False` برمی‌گرداند و `llm_client` همچنان `LlmError` می‌دهد؛ فقط تعداد تلاش‌ها کم می‌شود.
 - **اعتبارسنجی خروجی LLM**: همیشه با مدل Pydantic در `app/models.py`؛ هرگز دسترسی مستقیم به دیکشنری JSON خام در جاهای دیگر کد.
 - **پیام تلگرام**: با `parse_mode=HTML` (نه MarkdownV2) برای escaping ساده‌تر؛ محتوای آمده از پست/جدول با `html.escape(..., quote=False)` فرار داده می‌شود (فقط `<`, `>`, `&` — کوتیشن هرگز داخل صفت HTML نمی‌رود). ساخت پیام تنها در `formatting.format_message` انجام می‌شود.
-- **لاگ**: هرگز مقدار خام کلید/توکن در لاگ چاپ نشود؛ لاگ‌ها ساخت‌یافته و شامل `reddit_id` برای ردیابی باشند.
+- **لاگ**: هرگز مقدار خام کلید/توکن در لاگ چاپ نشود؛ لاگ‌ها ساخت‌یافته و شامل `reddit_id` برای ردیابی باشند. این قانون فقط به پیام‌های خود کد محدود نیست: لاگرهای کتابخانه‌های transport (`httpx`, `httpcore`, `openai`) در `main.setup_logging` روی `WARNING` قفل می‌شوند، چون httpx آدرس کامل درخواست را لاگ می‌کند و آدرس تلگرام خودِ توکن را در مسیر دارد (`/bot<TOKEN>/sendMessage`) و در سطح DEBUG هدرها (شامل کلید LLM) را هم چاپ می‌کند.
 - **تست**: تست‌های واحد هیچ تماس شبکه واقعی نمی‌زنند (RSS/LLM/Telegram/DB mock می‌شوند). منطق خالص (parsing، فرمت پیام، اعتبارسنجی schema) اولویت پوشش تست دارد.
 
 ### قالب پیام تلگرام (`app/formatting.py`)
@@ -444,7 +452,9 @@ volumes:
 pip install -r requirements.txt
 pytest
 ```
-تست‌های دیتابیس (`tests/test_repository.py` و بخش «real storage» در `tests/test_pipeline.py`) integration هستند و روی یک Postgres واقعی اجرا می‌شوند؛ اگر دیتابیسی بالا نباشد، خودشان را با یک پیام روشن skip می‌کنند. برای اجرای کامل: `docker compose up -d db` و سپس `pytest`.
+تست‌های دیتابیس (`tests/test_repository.py`، بخش «real storage» در `tests/test_pipeline.py` و `tests/test_pipeline_integration.py`) integration هستند و روی یک Postgres واقعی اجرا می‌شوند؛ اگر دیتابیسی بالا نباشد، خودشان را با یک پیام روشن skip می‌کنند. برای اجرای کامل: `docker compose up -d db` و سپس `pytest`.
+
+این تست‌ها روی دیتابیس اختصاصی `<DATABASE_URL>_test` اجرا می‌شوند (نه دیتابیس توسعه): `conftest.py` آن را در صورت نبودن می‌سازد و `db/schema.sql` را رویش اعمال می‌کند. بنابراین اجرای واقعی سرویس `worker` روی دیتابیس توسعه، تست‌ها را خراب نمی‌کند.
 
 ---
 
@@ -465,7 +475,7 @@ pytest
 
 این‌ها چیزهایی هستند که برای شروع پیاده‌سازی واقعی لازم‌اند و در این سند فقط با مقدار نمونه/placeholder پر شده‌اند:
 
-- **فهرست واقعی ساب‌ردیت‌ها/موضوعات** در `config/topics.yaml` (نمونه فعلی صرفاً illustrative است).
+- **فهرست واقعی ساب‌ردیت‌ها/موضوعات** در `config/topics.yaml` (نمونه فعلی صرفاً illustrative است). برای شروع ۱ تا ۲ ساب‌ردیت کم‌ترافیک کافی است تا هزینهٔ LLM و طول هر دور polling قابل پیش‌بینی بماند.
 - **نام/آدرس دقیق provider رایگان OpenAI-compatible** (مثلاً OpenRouter، Groq، یا مورد دیگر) و مدل مشخص، برای مقداردهی `OPENAI_BASE_URL` و `OPENAI_MODEL`.
 - **توکن ربات تلگرام** (از BotFather) و **`TELEGRAM_CHAT_ID`** مقصد.
 - تایید اینکه آستانه پیش‌فرض `MIN_IMPORTANCE_TO_SEND=low` (ارسال همه پست‌های مرتبط) مطلوب است یا کاربر از ابتدا می‌خواهد سخت‌گیرتر باشد (`medium`/`high`).
@@ -502,3 +512,10 @@ pytest
   4. **`main.py`**: SIGTERM/SIGINT به همان مسیر Ctrl+C ترجمه می‌شود تا `docker stop` فوری و تمیز تمام شود (NFR-2) و سطح لاگ از `LOG_LEVEL` می‌آید (NFR-3).
   5. ⚠️ پیش‌نیاز این فاز (افزودن `'skipped_low_importance'` به schema و بخش ۱۰) از قبل — با تغییرات فاز ۳/MVP — تأمین شده بود؛ در بازبینی کد تأیید شد که `db/schema.sql` و بخش ۱۰ هر دو همین مقدار را دارند، پس در این تغییر هیچ اصلاحی روی schema لازم نشد و هیچ Invariant‌ای تغییر نکرد.
 - **۲۰۲۶-۰۹-۲۸ (فاز ۳ — پوشش Postgres واقعی برای هستهٔ یکپارچه‌سازی)** — پنج سناریوی فاز ۳ که تا این‌جا فقط با `repository` درون‌حافظه‌ای تست می‌شدند، حالا یک‌بار هم با `repository` واقعی و از طریق `db/schema.sql` اجرا می‌شوند: ذخیره‌قبل‌از‌ارسال و ارسال دقیقاً یک‌بار (FR-9/FR-10)، رد کردن پست موجود بدون تماس دوبارهٔ LLM در دور بعد (Invariant 1)، نگاشت ایندکس کاندید شمارهٔ ۲ به `id` واقعی همان ردیف و نه عدد ۲ (Invariant 4)، `skipped_low_importance` بدون ارسال (FR-10 شرط ج)، و `failed` برای خروجی نامعتبر LLM بدون توقف بقیهٔ پست‌ها (Invariant 3 و 8). دلیل: تنها بازیابی ارسال ناموفق (FR-11) از قبل روی Postgres واقعی تست می‌شد و بقیهٔ مسیرها فقط با fake اثبات شده بودند؛ برای حساس‌ترین فایل پروژه اثبات روی خودِ دیتابیس لازم است. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۴ — تست یکپارچهٔ واقعی و پایداری اجرا)** — یک اجرای واقعی سرویس با `docker compose` (فید واقعی ریدیت + Postgres واقعی، LLM فقط برای این اجرا با یک stub محلی OpenAI-compatible و توکن نمایشی تلگرام) چند ساعت قبل از این تغییر انجام شد و چهار باگ واقعی را نشان داد؛ هر چهار مورد در همین تغییر رفع شدند:
+  1. **افشای توکن تلگرام در لاگ (نقض Invariant 6)**: httpx در سطح INFO آدرس کامل درخواست را لاگ می‌کند و آدرس Bot API خودِ توکن را در مسیر دارد (`/bot<TOKEN>/sendMessage`)، پس `docker logs` با `LOG_LEVEL=INFO` توکن را چاپ می‌کرد — درست همان چیزی که فاز ۳ سعی کرده بود جلویش را بگیرد. حالا `main.setup_logging` لاگرهای `httpx`, `httpcore` و `openai` را حداکثر روی `WARNING` قفل می‌کند (حتی با `LOG_LEVEL=DEBUG`، چون در DEBUG هدرها و در نتیجه کلید LLM هم چاپ می‌شوند). نتیجهٔ اندازه‌گیری‌شده: تعداد وقوع توکن در لاگ یک دور کامل ۲۵پستی از چند ده به صفر رسید.
+  2. **retry روی خطاهای دائمی (NFR-2)**: یک پاسخ 401 (توکن/کلید نامعتبر) سه بار با backoff بی‌فایده تکرار می‌شد. اندازه‌گیری واقعی: ۶.۲ ثانیه به‌ازای هر پست برای کلید نامعتبر LLM و ۳.۳ ثانیه به‌ازای هر پست برای توکن نامعتبر تلگرام (≈۸۰ ثانیه در هر دور ۲۵پستی و ۳ دقیقه و ۱ ثانیه در کل چرخهٔ اول). راه‌حل: کلاس `PermanentError` در `retry.py` و raise شدن آن از `reddit_source.fetch_feed`، `telegram_notifier` و `llm_client` برای 4xx (به‌جز 429)؛ موتور retry فوراً بالا می‌رود. همان چرخهٔ اول بعد از تغییر ۳۹.۶ ثانیه شد. قرارداد عمومی توابع عوض نشد: `send_message` همچنان `False` و `llm_client` همچنان `LlmError` می‌دهد.
+  3. **رعایت `Retry-After` در 429 ریدیت**: فیدهای `.rss` ریدیت در اجرای واقعی 429 برگرداندند و backoff ۱/۲ ثانیه‌ای تقریباً بلافاصله دوباره به همان endpoint می‌زد. حالا `reddit_source.fetch_feed` انتظار اعلام‌شدهٔ سرور را (با سقف `MAX_RETRY_AFTER_SECONDS = 30` تا یک فید کند کل دور را متوقف نکند) رعایت می‌کند و 4xx غیر از 429 را اصلاً retry نمی‌کند.
+  4. **جداسازی دیتابیس تست**: اجرای واقعی رکوردها را در همان دیتابیس توسعه (`reddit_digest`) می‌نوشت و ۵ تست مربوط به candidates/duplicate را خراب می‌کرد. حالا تست‌های دیتابیسی روی `<DATABASE_URL>_test` اجرا می‌شوند که `conftest.py` خودش می‌سازد (بخش ۱۳).
+  سایر تغییرات همین فاز: تست `tests/test_pipeline_integration.py` (دو دور متوالی `run_once()` روی Postgres واقعی و بایت‌های واقعی یک فید capture‌شده، با اثبات صریح Invariantهای ۱، ۷ و ۱۰)، تست `tests/test_llm_client.py` (پیش‌تر `llm_client` هیچ پوشش مستقیمی نداشت)، نمونهٔ واقعی فید در `tests/fixtures/reddit_learnmachinelearning.rss` (فیکسچرهای دست‌نویس از سند واقعی فاصله گرفته بودند: ریدیت تگ `r/<name>` را نمی‌فرستد و کل فید در یک خط می‌آید)، و یک نکتهٔ تست‌پذیری در `call_with_retries`: پارامتر `sleep` دیگر در زمان تعریف bind نمی‌شود و مثل `retryable` در زمان فراخوانی resolve می‌شود تا تست‌ها واقعاً نخوابند. هیچ Invariant‌ای تغییر نکرد، `db/schema.sql` دست‌نخورده است و هیچ وابستگی جدیدی اضافه نشد.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۴ — وضعیت تأیید)**: دیتابیس واقعی، parse واقعی فید ریدیت، نوشتن رکورد و تصمیم‌گیری status/`sent_at`، چند دور polling متوالی `worker` بدون کرش، و خروج تمیز روی `docker stop` (SIGTERM → کد خروج ۰ در کمتر از یک ثانیه) همه در Docker واقعاً اجرا و تأیید شدند. آنچه هنوز تأیید نشده: یک ارسال واقعی به تلگرام با توکن واقعی و یک پاسخ واقعی از provider مدل — این دو مورد در بخش ۱۵ باقی می‌مانند و به مقداردهی واقعی `.env` نیاز دارند.

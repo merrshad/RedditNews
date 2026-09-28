@@ -29,6 +29,8 @@ from tests.conftest import (
     TEST_REDDIT_ID_PREFIX,
     FakeChatCompletion,
     FakeRepository,
+    FakeSender,
+    FailingSender,
     patch_repository,
 )
 
@@ -83,36 +85,6 @@ def _pending(post_id: int = 5) -> PostRecord:
         key_points=["نکته"],
         status="to_send",
     )
-
-
-class FakeSender:
-    """Stand-in for ``app.telegram_notifier.send_message`` (NFR-8: no network).
-
-    It mirrors the real contract — text in, ``True`` only when Telegram accepted the
-    message — so a rejected send comes back as ``False`` and the pipeline keeps the record
-    as ``to_send`` for the next run (FR-10/FR-11).
-    """
-
-    def __init__(self, *, accept: bool = True, fail_first: bool = False) -> None:
-        self.accept = accept
-        self.fail_first = fail_first
-        self.messages: list[str] = []
-
-    def __call__(self, text: str) -> bool:
-        if self.fail_first:
-            self.fail_first = False
-            return False
-        if not self.accept:
-            return False
-        self.messages.append(text)
-        return True
-
-
-class FailingSender(FakeSender):
-    """A notifier that always reports a rejected send (Telegram is down)."""
-
-    def __init__(self) -> None:
-        super().__init__(accept=False)
 
 
 def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
