@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from app.models import AnalyzedPost, LlmAnalysis, PostRecord, RawPost, SimilarityCandidate
+from app.models import AnalyzedPost, LlmAnalysis, PostRecord, RawPost
 from app.pipeline import (
     Pipeline,
     build_analyzed_post,
@@ -16,7 +16,7 @@ from app.pipeline import (
 )
 from app.settings import Settings, TopicConfig
 from app.telegram_notifier import TelegramError
-from tests.conftest import StubLlmClient
+from tests.conftest import FakeChatCompletion
 
 VALID_ANSWER = {
     "is_relevant": True,
@@ -24,7 +24,7 @@ VALID_ANSWER = {
     "topic": "ai",
     "importance": "high",
     "summary_fa": "خلاصه فارسی پست.",
-    "key_points_fa": ["نکته اول"],
+    "key_points": ["نکته اول"],
 }
 
 
@@ -48,11 +48,25 @@ def _pending(post_id: int = 5) -> PostRecord:
         source_topic_key="ai",
         title=f"Pending post {post_id}",
         url=f"https://example.com/pending/{post_id}",
-        topic=None,
+        topic="ai",
         importance="medium",
         summary_fa="خلاصه پست معلق.",
         key_points=["نکته"],
         status="to_send",
+    )
+
+
+def _candidate() -> PostRecord:
+    return PostRecord(
+        id=77,
+        reddit_id="t3_prev",
+        subreddit="MachineLearning",
+        source_topic_key="ai",
+        title="Previous",
+        url="https://example.com/prev",
+        summary_fa="خلاصه",
+        key_points=["نکته"],
+        status="sent",
     )
 
 
@@ -63,7 +77,7 @@ class FakeRepository:
         self,
         *,
         existing: tuple[str, ...] = (),
-        candidates: tuple[SimilarityCandidate, ...] = (),
+        candidates: tuple[PostRecord, ...] = (),
         pending: tuple[PostRecord, ...] = (),
     ) -> None:
         self.existing = set(existing)
@@ -78,7 +92,7 @@ class FakeRepository:
         self.calls.append("exists")
         return reddit_id in self.existing
 
-    def get_similarity_candidates(self, *, limit: int, hours: int) -> list[SimilarityCandidate]:
+    def get_similarity_candidates(self, *, limit: int, hours: int) -> list[PostRecord]:
         self.calls.append(f"candidates(limit={limit},hours={hours})")
         return list(self.candidates)
 
@@ -116,22 +130,35 @@ class FailingNotifier(FakeNotifier):
         raise TelegramError("sendMessage rejected")
 
 
+def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
+    raise RuntimeError("provider down")
+
+
+@pytest.fixture
+def llm(monkeypatch: pytest.MonkeyPatch) -> FakeChatCompletion:
+    """Replace the LLM transport with a canned (valid) answer; tests may change it."""
+    fake = FakeChatCompletion(json.dumps(VALID_ANSWER, ensure_ascii=False))
+    monkeypatch.setattr("app.analyzer.chat_completion", fake)
+    return fake
+
+
 def _build_pipeline(
     *,
     settings: Settings,
     topics: list[TopicConfig],
     repository: FakeRepository,
-    answer: str = json.dumps(VALID_ANSWER, ensure_ascii=False),
+    llm: FakeChatCompletion,
+    answer: str | None = None,
     notifier: FakeNotifier | None = None,
 ) -> tuple[Pipeline, FakeNotifier]:
+    if answer is not None:
+        llm.answer = answer
     notifier = notifier if notifier is not None else FakeNotifier()
     pipeline = Pipeline(
         settings=settings,
         repository=repository,  # type: ignore[arg-type]
-        llm_client=StubLlmClient(answer),  # type: ignore[arg-type]
         notifier=notifier,  # type: ignore[arg-type]
         topics=topics,
-        system_prompt="SYSTEM",
     )
     return pipeline, notifier
 
@@ -164,7 +191,7 @@ def test_meets_importance_threshold(importance: str | None, minimum: str, expect
 def test_determine_status_covers_every_outcome() -> None:
     relevant = LlmAnalysis.model_validate(VALID_ANSWER)
     irrelevant = LlmAnalysis.model_validate(
-        {**VALID_ANSWER, "is_relevant": False, "topic": None, "summary_fa": ""}
+        {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""}
     )
     low_importance = LlmAnalysis.model_validate({**VALID_ANSWER, "importance": "low"})
 
@@ -207,10 +234,12 @@ def test_to_post_record_copies_the_stored_fields() -> None:
 
 
 def test_run_once_skips_a_post_that_is_already_stored(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository(existing=("t3_1abcde",))
-    pipeline, notifier = _build_pipeline(settings=settings, topics=topics, repository=repository)
+    pipeline, notifier = _build_pipeline(
+        settings=settings, topics=topics, repository=repository, llm=llm
+    )
 
     pipeline.run_once()
 
@@ -220,16 +249,16 @@ def test_run_once_skips_a_post_that_is_already_stored(
 
 
 def test_run_once_stores_irrelevant_posts_without_sending(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
     pipeline, notifier = _build_pipeline(
         settings=settings,
         topics=topics,
         repository=repository,
+        llm=llm,
         answer=json.dumps(
-            {**VALID_ANSWER, "is_relevant": False, "topic": None, "summary_fa": ""},
-            ensure_ascii=False,
+            {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""}, ensure_ascii=False
         ),
     )
 
@@ -241,16 +270,14 @@ def test_run_once_stores_irrelevant_posts_without_sending(
 
 
 def test_run_once_maps_a_duplicate_index_to_the_real_database_id(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
-    candidate = SimilarityCandidate(
-        id=77, reddit_id="t3_prev", title="Previous", summary_fa="خلاصه"
-    )
-    repository = FakeRepository(candidates=(candidate,))
+    repository = FakeRepository(candidates=(_candidate(),))
     pipeline, notifier = _build_pipeline(
         settings=settings,
         topics=topics,
         repository=repository,
+        llm=llm,
         answer=json.dumps({**VALID_ANSWER, "duplicate_of_candidate_index": 1}, ensure_ascii=False),
     )
 
@@ -262,15 +289,20 @@ def test_run_once_maps_a_duplicate_index_to_the_real_database_id(
 
 
 def test_run_once_sends_a_qualifying_post_only_after_storing_it(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
-    pipeline, notifier = _build_pipeline(settings=settings, topics=topics, repository=repository)
+    pipeline, notifier = _build_pipeline(
+        settings=settings, topics=topics, repository=repository, llm=llm
+    )
 
     pipeline.run_once()
 
     assert repository.inserted[0].status == "to_send"
-    assert repository.inserted[0].llm_raw_response is not None
+    # FR-9/NFR-3: the validated analysis is kept for audit.
+    assert repository.inserted[0].llm_raw_response == LlmAnalysis.model_validate(
+        VALID_ANSWER
+    ).model_dump(mode="json")
     assert repository.sent_ids == [repository._next_id]
     assert len(notifier.messages) == 1
     assert "خلاصه فارسی پست." in notifier.messages[0]
@@ -279,13 +311,14 @@ def test_run_once_sends_a_qualifying_post_only_after_storing_it(
 
 
 def test_run_once_respects_a_higher_importance_threshold(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
     pipeline, notifier = _build_pipeline(
         settings=settings.model_copy(update={"min_importance_to_send": "high"}),
         topics=topics,
         repository=repository,
+        llm=llm,
         answer=json.dumps({**VALID_ANSWER, "importance": "low"}, ensure_ascii=False),
     )
 
@@ -296,11 +329,11 @@ def test_run_once_respects_a_higher_importance_threshold(
 
 
 def test_run_once_records_failed_status_for_invalid_llm_output(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
     pipeline, notifier = _build_pipeline(
-        settings=settings, topics=topics, repository=repository, answer="sorry, no json"
+        settings=settings, topics=topics, repository=repository, llm=llm, answer="sorry, no json"
     )
 
     pipeline.run_once()
@@ -311,20 +344,15 @@ def test_run_once_records_failed_status_for_invalid_llm_output(
 
 
 def test_run_once_leaves_the_post_unstored_when_the_llm_call_itself_fails(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class FailingLlmClient:
-        def complete(self, *, system_prompt: str, user_prompt: str) -> str:
-            raise RuntimeError("provider down")
-
+    monkeypatch.setattr("app.analyzer.chat_completion", _raise_runtime_error)
     repository = FakeRepository()
     pipeline = Pipeline(
         settings=settings,
         repository=repository,  # type: ignore[arg-type]
-        llm_client=FailingLlmClient(),  # type: ignore[arg-type]
         notifier=FakeNotifier(),  # type: ignore[arg-type]
         topics=topics,
-        system_prompt="SYSTEM",
     )
 
     pipeline.run_once()
@@ -335,7 +363,10 @@ def test_run_once_leaves_the_post_unstored_when_the_llm_call_itself_fails(
 
 
 def test_run_once_keeps_processing_after_one_post_fails(
-    settings: Settings, topics: list[TopicConfig], monkeypatch: pytest.MonkeyPatch
+    settings: Settings,
+    topics: list[TopicConfig],
+    llm: FakeChatCompletion,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         "app.pipeline.fetch_posts",
@@ -343,7 +374,7 @@ def test_run_once_keeps_processing_after_one_post_fails(
     )
     repository = FakeRepository()
     pipeline, _ = _build_pipeline(
-        settings=settings, topics=topics, repository=repository, answer="not json"
+        settings=settings, topics=topics, repository=repository, llm=llm, answer="not json"
     )
 
     pipeline.run_once()
@@ -353,7 +384,10 @@ def test_run_once_keeps_processing_after_one_post_fails(
 
 
 def test_run_once_retries_pending_sends_without_re_analysing(
-    settings: Settings, topics: list[TopicConfig], monkeypatch: pytest.MonkeyPatch
+    settings: Settings,
+    topics: list[TopicConfig],
+    llm: FakeChatCompletion,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fetched: list[str] = []
     monkeypatch.setattr(
@@ -361,7 +395,9 @@ def test_run_once_retries_pending_sends_without_re_analysing(
         lambda topics, *, max_retries: fetched.append("fetch") or [],
     )
     repository = FakeRepository(pending=(_pending(5),))
-    pipeline, notifier = _build_pipeline(settings=settings, topics=topics, repository=repository)
+    pipeline, notifier = _build_pipeline(
+        settings=settings, topics=topics, repository=repository, llm=llm
+    )
 
     pipeline.run_once()
 
@@ -369,16 +405,18 @@ def test_run_once_retries_pending_sends_without_re_analysing(
     assert "خلاصه پست معلق." in notifier.messages[0]
     assert repository.calls.index("fetch_pending_send") < repository.calls.index("mark_sent")
     assert fetched == ["fetch"]
+    assert llm.calls == []  # FR-11: no second LLM call
 
 
 def test_run_once_keeps_a_failed_send_as_to_send(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
     pipeline, _ = _build_pipeline(
         settings=settings,
         topics=topics,
         repository=repository,
+        llm=llm,
         notifier=FailingNotifier(),
     )
 
@@ -389,14 +427,17 @@ def test_run_once_keeps_a_failed_send_as_to_send(
 
 
 def test_run_once_continues_with_the_next_pending_send_after_a_failure(
-    settings: Settings, topics: list[TopicConfig], monkeypatch: pytest.MonkeyPatch
+    settings: Settings,
+    topics: list[TopicConfig],
+    llm: FakeChatCompletion,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.pipeline.fetch_posts", lambda topics, *, max_retries: [])
     repository = FakeRepository(pending=(_pending(5), _pending(6)))
     notifier = FakeNotifier()
     notifier.fail_first = True
     pipeline, notifier = _build_pipeline(
-        settings=settings, topics=topics, repository=repository, notifier=notifier
+        settings=settings, topics=topics, repository=repository, llm=llm, notifier=notifier
     )
 
     pipeline.run_once()
@@ -407,7 +448,10 @@ def test_run_once_continues_with_the_next_pending_send_after_a_failure(
 
 
 def test_run_once_wires_real_modules_end_to_end(
-    settings: Settings, topics: list[TopicConfig], monkeypatch: pytest.MonkeyPatch
+    settings: Settings,
+    topics: list[TopicConfig],
+    llm: FakeChatCompletion,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only the HTTP (RSS/LLM) and storage boundaries are faked, everything else is real."""
     from tests.test_reddit_source import SAMPLE_FEED
@@ -416,7 +460,9 @@ def test_run_once_wires_real_modules_end_to_end(
         "app.reddit_source.fetch_feed", lambda feed_url, *, max_retries: SAMPLE_FEED.encode()
     )
     repository = FakeRepository()
-    pipeline, notifier = _build_pipeline(settings=settings, topics=topics, repository=repository)
+    pipeline, notifier = _build_pipeline(
+        settings=settings, topics=topics, repository=repository, llm=llm
+    )
 
     pipeline.run_once()
 
@@ -437,10 +483,12 @@ def test_run_once_wires_real_modules_end_to_end(
 
 
 def test_resolve_duplicate_ignores_an_out_of_range_index(
-    settings: Settings, topics: list[TopicConfig]
+    settings: Settings, topics: list[TopicConfig], llm: FakeChatCompletion
 ) -> None:
     repository = FakeRepository()
-    pipeline, _ = _build_pipeline(settings=settings, topics=topics, repository=repository)
+    pipeline, _ = _build_pipeline(
+        settings=settings, topics=topics, repository=repository, llm=llm
+    )
     analysis = LlmAnalysis.model_validate({**VALID_ANSWER, "duplicate_of_candidate_index": 9})
 
     assert pipeline._resolve_duplicate(analysis, []) is None

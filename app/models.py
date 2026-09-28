@@ -39,31 +39,22 @@ class RawPost(BaseModel):
     published_at: datetime | None = None
 
 
-class SimilarityCandidate(BaseModel):
-    """A recent, already-analysed post offered to the LLM as a duplicate candidate.
-
-    ``reddit_id``/``id`` are never shown to the LLM; only its 1-based position is
-    (Invariant 4).
-    """
-
-    id: int
-    reddit_id: str
-    title: str
-    summary_fa: str | None = None
-
-
 class LlmAnalysis(BaseModel):
-    """Validated output of the single analysis LLM call (FR-3..FR-8)."""
+    """Validated output of the single analysis LLM call (FR-3..FR-8).
+
+    Duplicate candidates are referenced only by their 1-based position in the list sent
+    to the model — never by a database id (Invariant 4).
+    """
 
     is_relevant: bool
     duplicate_of_candidate_index: int | None = Field(
         default=None,
         description="1-based index into the candidate list, or null when not a duplicate.",
     )
-    topic: str | None = None
+    topic: str
     importance: ImportanceLevel
     summary_fa: str
-    key_points_fa: list[str] = Field(default_factory=list)
+    key_points: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "LlmAnalysis":

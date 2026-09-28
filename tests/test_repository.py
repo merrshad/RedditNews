@@ -33,8 +33,36 @@ def test_exists_returns_false_when_no_row_is_found() -> None:
 
 def test_get_similarity_candidates_maps_rows_and_passes_limits() -> None:
     rows = [
-        {"id": 7, "reddit_id": "t3_new", "title": "Newest", "summary_fa": "خلاصه"},
-        {"id": 3, "reddit_id": "t3_old", "title": "Older", "summary_fa": None},
+        {
+            "id": 7,
+            "reddit_id": "t3_new",
+            "subreddit": "MachineLearning",
+            "source_topic_key": "ai",
+            "title": "Newest",
+            "url": "https://example.com/7",
+            "author": "somebody",
+            "topic": "ai",
+            "importance": "high",
+            "summary_fa": "خلاصه",
+            "key_points": ["نکته"],
+            "published_at": None,
+            "status": "sent",
+        },
+        {
+            "id": 3,
+            "reddit_id": "t3_old",
+            "subreddit": "MachineLearning",
+            "source_topic_key": "ai",
+            "title": "Older",
+            "url": "https://example.com/3",
+            "author": None,
+            "topic": None,
+            "importance": None,
+            "summary_fa": None,
+            "key_points": [],
+            "published_at": None,
+            "status": "sent",
+        },
     ]
     repository, connection = _repository([rows])
 

@@ -12,9 +12,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from app.analyzer import LlmOutputError, analyze_post, load_system_prompt
+from app.analyzer import AnalysisError, analyze
 from app.formatting import format_post_message
-from app.llm_client import LlmClient
 from app.models import (
     IMPORTANCE_ORDER,
     AnalyzedPost,
@@ -22,7 +21,6 @@ from app.models import (
     PostRecord,
     PostStatus,
     RawPost,
-    SimilarityCandidate,
 )
 from app.reddit_source import fetch_posts
 from app.repository import PostRepository
@@ -78,7 +76,7 @@ def build_analyzed_post(
         topic=analysis.topic if analysis else None,
         importance=analysis.importance if analysis else None,
         summary_fa=analysis.summary_fa if analysis else None,
-        key_points=list(analysis.key_points_fa) if analysis else [],
+        key_points=list(analysis.key_points) if analysis else [],
         llm_raw_response=raw_response,
         status=status,
     )
@@ -102,19 +100,14 @@ class Pipeline:
         *,
         settings: Settings,
         repository: PostRepository,
-        llm_client: LlmClient,
         notifier: TelegramNotifier,
         topics: Sequence[TopicConfig],
-        system_prompt: str | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
-        self._llm_client = llm_client
         self._notifier = notifier
         self._topics = list(topics)
-        self._allowed_topics = [topic.key for topic in self._topics]
         self._topic_names = topic_display_names(self._topics)
-        self._system_prompt = system_prompt if system_prompt is not None else load_system_prompt()
 
     def run_once(self) -> None:
         """One full pipeline cycle; never raises for a single bad post/feed."""
@@ -159,14 +152,8 @@ class Pipeline:
         )
 
         try:
-            outcome = analyze_post(
-                post,
-                candidates,
-                llm_client=self._llm_client,
-                allowed_topics=self._allowed_topics,
-                system_prompt=self._system_prompt,
-            )
-        except LlmOutputError as exc:
+            analysis = analyze(post, candidates, self._topics)
+        except AnalysisError as exc:
             # Invariant 3: invalid output is recorded as failed, never assumed valid.
             logger.error("Invalid LLM output for reddit_id=%s: %s", post.reddit_id, exc)
             self._repository.insert_post(
@@ -174,23 +161,24 @@ class Pipeline:
             )
             return
         except Exception as exc:
-            # Transient LLM/network trouble: leave the post unfetched-in-DB so the next
-            # run analyses it again (no record, no send, no duplicate).
+            # Transient LLM/network trouble: leave the post unrecorded so the next run
+            # analyses it again (no record, no send, no duplicate).
             logger.error("LLM call failed for reddit_id=%s: %s", post.reddit_id, exc)
             return
 
-        duplicate_of_id = self._resolve_duplicate(outcome.analysis, candidates)
+        duplicate_of_id = self._resolve_duplicate(analysis, candidates)
         status = determine_status(
-            outcome.analysis,
+            analysis,
             duplicate_of_id=duplicate_of_id,
             min_importance_to_send=self._settings.min_importance_to_send,
         )
         analyzed = build_analyzed_post(
             post,
             status=status,
-            analysis=outcome.analysis,
+            analysis=analysis,
             duplicate_of_id=duplicate_of_id,
-            raw_response=outcome.raw_response,
+            # FR-9/NFR-3: keep the validated analysis JSON for audit/debugging.
+            raw_response=analysis.model_dump(mode="json"),
         )
 
         # Invariant 2: store first, send only afterwards.
@@ -206,7 +194,7 @@ class Pipeline:
 
     @staticmethod
     def _resolve_duplicate(
-        analysis: LlmAnalysis, candidates: Sequence[SimilarityCandidate]
+        analysis: LlmAnalysis, candidates: Sequence[PostRecord]
     ) -> int | None:
         """Invariant 4 — map the LLM's local 1-based index to a real database id."""
         index = analysis.duplicate_of_candidate_index
