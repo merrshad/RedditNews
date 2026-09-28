@@ -150,6 +150,48 @@ def test_load_topics_config_reads_the_shipped_default_config() -> None:
 # --- parsing (pure, FR-1) ---------------------------------------------------------
 
 
+def test_parse_entry_falls_back_to_the_updated_date() -> None:
+    """FR-1: an entry may carry only ``<updated>`` — the date must not be lost."""
+    document = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>t3_updatedonly</id>
+        <title>Only an updated stamp</title>
+        <link href="https://www.reddit.com/r/mlops/comments/updatedonly/x/" />
+        <updated>2026-09-27T11:30:00+00:00</updated>
+      </entry>
+    </feed>"""
+
+    (post,) = parse_feed(document, source_topic_key="ai")
+
+    assert post.published_at == datetime(2026, 9, 27, 11, 30, tzinfo=timezone.utc)
+
+
+def test_parse_entry_without_any_date_still_parses() -> None:
+    """FR-1: a missing date is not a reason to drop a post (``published_at`` is nullable).
+
+    The column is nullable on purpose and ``fetch_recent_candidates`` falls back to
+    ``fetched_at``, so the post is stored and analyses normally; only the recency window
+    is decided by the fetch time instead of the post time.
+    """
+    document = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>t3_nodate</id>
+        <title>No date at all</title>
+        <link href="https://www.reddit.com/r/mlops/comments/nodate/x/" />
+        <content type="html">body</content>
+      </entry>
+    </feed>"""
+
+    (post,) = parse_feed(document, source_topic_key="ai")
+
+    assert post.reddit_id == "t3_nodate"
+    assert post.published_at is None
+    assert post.title == "No date at all"
+    assert post.subreddit == "unknown"  # no r/<name> tag and no feed URL to fall back to
+
+
 def test_parse_feed_maps_every_required_field(sample_feed: bytes) -> None:
     posts = parse_feed(sample_feed, source_topic_key="ai", feed_url=FEED_URL)
 
@@ -366,6 +408,52 @@ def test_fetch_feed_stops_at_once_for_a_permanent_client_error(
         fetch_feed(FEED_URL)
 
     assert len(calls) == 1
+
+
+def test_fetch_feed_retries_a_timeout_and_gives_up_after_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NFR-2: a feed that never answers is an ordinary bounded failure.
+
+    A timeout is the realistic "this feed is having a bad day" case, and it must behave
+    exactly like any other transport error: retried up to ``HTTP_MAX_RETRIES`` and then
+    raised, so ``fetch_all`` can skip that feed and keep the rest of the run.
+    """
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
+        calls.append(url)
+        raise httpx.ReadTimeout("timed out while reading the feed")
+
+    monkeypatch.setattr("app.reddit_source.httpx.get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setenv("HTTP_MAX_RETRIES", "3")
+
+    with pytest.raises(httpx.ReadTimeout):
+        fetch_feed(FEED_URL)
+
+    assert len(calls) == 3
+
+
+def test_fetch_all_skips_a_timed_out_feed_and_parses_the_rest(
+    monkeypatch: pytest.MonkeyPatch, sample_feed: bytes
+) -> None:
+    """Invariant 8: one unresponsive feed must never stop the other feeds."""
+    config = _topics_config(
+        feeds={"ai": ["https://slow.example/feed.rss"], "startup": ["https://ok.example/feed.rss"]}
+    )
+
+    def fake_fetch_feed(feed_url: str) -> bytes:
+        if "slow" in feed_url:
+            raise httpx.ReadTimeout("timed out")
+        return sample_feed
+
+    monkeypatch.setattr("app.reddit_source.fetch_feed", fake_fetch_feed)
+
+    posts = fetch_all(config)
+
+    assert [post.reddit_id for post in posts] == ["t3_1abcde", "t3_2fghij"]
+    assert {post.source_topic_key for post in posts} == {"startup"}
 
 
 # --- fetch_all (FR-1) -------------------------------------------------------------

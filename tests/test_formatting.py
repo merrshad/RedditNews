@@ -16,6 +16,7 @@ from app.formatting import (
     escape_html,
     format_message,
     importance_label,
+    truncate,
 )
 from app.models import PostRecord
 
@@ -165,6 +166,56 @@ def test_format_message_keeps_a_long_title_and_summary_inside_the_limit() -> Non
     message = format_message(_post(title="ت" * 5000, summary_fa="ب" * 5000))
 
     assert len(message) <= TELEGRAM_MESSAGE_LIMIT
+
+
+def test_format_message_renders_every_key_point_it_is_given() -> None:
+    """The model is asked for 2-5 bullets (FR-8) but is not hard-limited (see test_analyzer).
+
+    Whatever arrives is rendered: dropping or reordering bullets here would silently change
+    what the reader sees.
+    """
+    points = [f"نکته شماره {index}" for index in range(1, 8)]
+
+    message = format_message(_post(key_points=points))
+
+    for point in points:
+        assert f"• {point}" in message
+    # One bullet per line in the key-points section (the metadata row uses " • " inline).
+    assert message.count("\n• ") == len(points)
+
+
+@pytest.mark.parametrize(
+    ("text", "limit", "expected"),
+    [
+        ("abc", 3, "abc"),  # exactly at the limit: untouched, no ellipsis
+        ("abcd", 3, "ab…"),
+        ("abcd", 1, "…"),  # the ellipsis is the only thing that fits
+        ("", 5, ""),
+        ("abc", 0, ""),  # a non-positive limit yields nothing rather than crashing
+    ],
+)
+def test_truncate_handles_the_boundaries(text: str, limit: int, expected: str) -> None:
+    """`truncate` is the last line of defence for a message that cannot be shortened."""
+    assert truncate(text, limit) == expected
+
+
+def test_truncate_never_returns_more_than_the_limit() -> None:
+    assert all(len(truncate("x" * 100, limit)) <= limit for limit in range(1, 20))
+
+
+def test_format_message_shortens_a_summary_that_is_exactly_one_char_too_long() -> None:
+    """The boundary where shortening has to kick in, rather than far beyond it."""
+    fitting = format_message(_post(summary_fa="ب" * 1000, key_points=[]))
+    room = len(fitting) - len("ب" * 1000)
+    exact = format_message(_post(summary_fa="ب" * (TELEGRAM_MESSAGE_LIMIT - room), key_points=[]))
+    over = format_message(
+        _post(summary_fa="ب" * (TELEGRAM_MESSAGE_LIMIT - room + 1), key_points=[])
+    )
+
+    assert len(exact) == TELEGRAM_MESSAGE_LIMIT
+    assert "…" not in exact
+    assert len(over) <= TELEGRAM_MESSAGE_LIMIT
+    assert "…" in over
 
 
 def test_format_message_survives_a_pathological_key_point_list() -> None:

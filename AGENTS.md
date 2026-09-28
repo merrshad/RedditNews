@@ -147,7 +147,7 @@
 | FR-5 | تعیین موضوع | خروجی LLM شامل `topic` است که باید یکی از مقادیر تعریف‌شده در `config/topics.yaml` باشد. |
 | FR-6 | تعیین اهمیت | خروجی LLM شامل `importance` با یکی از سه مقدار `low` / `medium` / `high` است. |
 | FR-7 | تولید خلاصه فارسی | خروجی LLM شامل `summary_fa` است: خلاصه‌ای فارسی، مستقل از زبان پست اصلی. |
-| FR-8 | استخراج نکات مهم | خروجی LLM شامل `key_points` است: آرایه‌ای از ۲ تا ۵ رشته‌ی فارسی کوتاه (نکته‌به‌نکته). |
+| FR-8 | استخراج نکات مهم | خروجی LLM شامل `key_points` است: آرایه‌ای از ۲ تا ۵ رشته‌ی فارسی کوتاه (نکته‌به‌نکته). این محدوده در `app/prompts/analysis_prompt.md` به مدل اعلام می‌شود؛ `LlmAnalysis` عمداً روی *تعداد* سخت‌گیر نیست (بخش ۱۲) تا یک نکتهٔ اضافه باعث `failed` شدن و از دست رفتن یک پست معتبر نشود. |
 | FR-9 | ذخیره در دیتابیس | نتیجه نهایی — چه پست مرتبط باشد چه نه — همیشه در جدول `posts` ذخیره می‌شود (برای جلوگیری از پردازش مجدد و برای audit). خروجی تحلیل (JSON اعتبارسنجی‌شده با Pydantic) هم در `llm_raw_response` نگه داشته می‌شود. |
 | FR-10 | ارسال تلگرام | فقط پست‌هایی که `is_relevant = true`، `duplicate_of_id = null` و `importance >= MIN_IMPORTANCE_TO_SEND` باشند، به `TELEGRAM_CHAT_ID` ارسال می‌شوند. پیام شامل عنوان، subreddit، موضوع، اهمیت (فارسی)، خلاصه فارسی، نکات کلیدی (bullet) و لینک پست است. پس از ارسال موفق، `status='sent'` و `sent_at` ثبت می‌شود. |
 | FR-11 | بازیابی پس از کرش | در ابتدای هر اجرا، پیش از واکشی RSS جدید، پست‌های با `status='to_send'` باقی‌مانده از اجرای قبلی دوباره برای ارسال تلاش می‌شوند (بدون تحلیل مجدد با LLM). |
@@ -228,14 +228,14 @@ reddit-telegram-digest/
 │   ├── main.py                # نقطه ورود: حلقه `pipeline.run_once()` + خروج تمیز روی SIGTERM (NFR-2/NFR-3)
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
 │   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
-│   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
+│   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all, topic_display_names → FR-1
 │   ├── repository.py          # تمام پرس‌وجوهای DB؛ API: exists, save, update_status, fetch_recent_candidates, fetch_pending_to_send → FR-2, FR-4, FR-9, FR-11
 │   ├── llm_client.py          # تنها تماس خام LLM: chat_completion() روی SDK OpenAI-compatible + retry
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
 │   ├── analyzer.py            # ساخت prompt، فراخوانی chat_completion، اعتبارسنجی → analyze()/AnalysisError → FR-3..FR-8
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
-│   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
+│   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)؛ API: format_message(post, topic_name=...) → FR-10
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن + `PermanentError` (DRY، NFR-2)
 │   └── pipeline.py            # orchestration؛ API: run_once, retry_pending_sends → FR-1..FR-11
 └── tests/
@@ -248,9 +248,11 @@ reddit-telegram-digest/
     ├── test_formatting.py
     ├── test_telegram_notifier.py
     ├── test_llm_client.py
+    ├── test_retry.py
     ├── test_main.py
     ├── test_pipeline.py
-    └── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴)
+    ├── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴)
+    └── test_docs_consistency.py       # Invariant 11: تطبیق همین سند با کد واقعی (بخش ۱۴)
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
@@ -353,24 +355,25 @@ LOG_LEVEL=INFO
 | `HTTP_MAX_RETRIES` | حداکثر تعداد تلاش کل هر تماس خارجی (شامل تلاش اول؛ backoff نمایی بین تلاش‌ها) | 3 |
 | `LOG_LEVEL` | سطح لاگ | `INFO` |
 
-فایل `config/topics.yaml` (نمونه — **فهرست واقعی باید توسط کاربر تکمیل شود**، بخش ۱۵):
+فایل `config/topics.yaml` (فهرست واقعی فعلی — دو ساب‌ردیت کم‌ترافیک که در فاز ۴ انتخاب شدند، بخش ۱۵):
 
 ```yaml
 topics:
   - key: ai
     name: "هوش مصنوعی"
     feeds:
-      - "https://www.reddit.com/r/MachineLearning/new/.rss"
-      - "https://www.reddit.com/r/artificial/new/.rss"
+      - "https://www.reddit.com/r/mlops/new/.rss"
   - key: startup
     name: "استارتاپ"
     feeds:
-      - "https://www.reddit.com/r/startups/new/.rss"
+      - "https://www.reddit.com/r/venturecapital/new/.rss"
 ```
 
 ---
 
 ## ۱۲. قراردادهای کدنویسی
+
+> محدودهٔ «۲ تا ۵ نکته» در FR-8 (و محدودهٔ ۲ تا ۴ جمله برای `summary_fa`) **دستور به مدل** است، نه شرط اعتبارسنجی: در `analysis_prompt.md` خواسته می‌شود، ولی `LlmAnalysis` روی تعداد آیتم‌ها سخت‌گیر نیست. دلیل: Invariant 3 باید خروجی غیرقابل‌اعتماد را رد کند، و «یک نکته اضافه» خروجی غیرقابل‌اعتماد نیست — رد کردنش یک پست معتبر را `failed` می‌کند و خلاصه‌ای که کاربر می‌خواست را از بین می‌برد. `formatting` هر تعداد نکته را رندر می‌کند و پیام را در حد مجاز تلگرام نگه می‌دارد (فرمت خروجی و طول، قابل کنترل در کد است؛ فهم محتوا نه).
 
 - **KISS**: ساده‌ترین راه‌حلی که الزامات را برآورده می‌کند انتخاب شود؛ انتزاع (abstraction) اضافه، لایه‌های غیرضروری، یا generalization زودهنگام ممنوع است.
 - **DRY**: منطق تکراری (مثلاً retry، اعتبارسنجی، فرمت تاریخ) فقط یک‌بار در یک ماژول مشترک (`retry.py`, `models.py`) نوشته می‌شود.
@@ -420,32 +423,17 @@ cp .env.example .env
 docker compose up --build
 ```
 
-### نمونه `docker-compose.yml` (نقطه شروع پیشنهادی)
-```yaml
-services:
-  db:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: reddit_digest
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-    ports:
-      - "5432:5432"
+### سرویس‌های compose
+دو سرویس وجود دارد و تعریف واقعی آن‌ها فقط در `docker-compose.yml` نگه داشته می‌شود (تکرارش این‌جا یعنی دو جا برای drift داشتن):
 
-  worker:
-    build: .
-    restart: unless-stopped
-    env_file: .env
-    depends_on:
-      - db
+- `db`: Postgres 16، با یک healthcheck (`pg_isready`) و mount شدن `db/schema.sql` در
+  `/docker-entrypoint-initdb.d` تا در **اولین** بوت schema اعمال شود (Invariant 9).
+- `worker`: همان ایمیج پایتون (`Dockerfile`)، `env_file: .env`، و `depends_on` با شرط
+  `service_healthy` تا هیچ دوری قبل از آماده بودن دیتابیس شروع نشود.
 
-volumes:
-  pgdata:
-```
+نکتهٔ عملیاتی: `db/schema.sql` فقط زمانی خودکار اعمال می‌شود که volume دیتابیس خالی باشد؛
+اگر بعداً schema تغییر کرد، یا آن را دستی روی دیتابیس اجرا کنید یا `docker compose down -v`
+را آگاهانه بزنید (Invariant 9: هیچ تغییر schema بیرون از `db/schema.sql` مجاز نیست).
 
 ### اجرای تست‌ها
 ```bash
@@ -476,9 +464,10 @@ pytest
 این‌ها چیزهایی هستند که برای شروع پیاده‌سازی واقعی لازم‌اند و در این سند فقط با مقدار نمونه/placeholder پر شده‌اند:
 
 - ~~**فهرست واقعی ساب‌ردیت‌ها/موضوعات**~~ — انجام شد (فاز ۴): دو فید کم‌ترافیک واقعی در `config/topics.yaml` قرار گرفتند (`r/mlops` ≈۳ پست/روز و `r/venturecapital` ≈۰.۴ پست/روز، هر دو اندازه‌گیری‌شده روی فید زنده) تا هزینهٔ LLM و طول هر دور polling قابل پیش‌بینی بماند. افزودن فید پرترافیک‌تر فقط یک خط YAML است.
-- **نام/آدرس دقیق provider رایگان OpenAI-compatible** (مثلاً OpenRouter، Groq، یا مورد دیگر) و مدل مشخص، برای مقداردهی `OPENAI_BASE_URL` و `OPENAI_MODEL`.
-- **توکن ربات تلگرام** (از BotFather) و **`TELEGRAM_CHAT_ID`** مقصد.
-- تایید اینکه آستانه پیش‌فرض `MIN_IMPORTANCE_TO_SEND=low` (ارسال همه پست‌های مرتبط) مطلوب است یا کاربر از ابتدا می‌خواهد سخت‌گیرتر باشد (`medium`/`high`).
+- **نام/آدرس دقیق provider رایگان OpenAI-compatible** (مثلاً OpenRouter، Groq، یا مورد دیگر) و مدل مشخص، برای مقداردهی `OPENAI_BASE_URL` و `OPENAI_MODEL`. **باز است**: تا این لحظه provider/مدل واقعی انتخاب نشده و نام آن در این سند ثبت نشده — طبق قانون بخش ۱۴ دو مقدار حدسی نمی‌نویسیم؛ به‌محض انتخاب، فقط نام provider و مدل (بدون هیچ کلیدی، Invariant 6) همین‌جا اضافه می‌شود.
+- **توکن ربات تلگرام** (از BotFather) و **`TELEGRAM_CHAT_ID`** مقصد. **باز است** و به‌صورت `[REPLACE]` در `.env` (که commit نمی‌شود) قرار دارد؛ هیچ‌وقت در این سند یا کد نوشته نمی‌شود (Invariant 6).
+- **ارسال واقعی انتها-به-انتها**: مسیر RSS→Postgres→تصمیم status/`sent_at` و چند دور polling و خروج تمیز روی `docker stop` واقعاً در Docker اجرا و تأیید شده‌اند (فاز ۴)، اما یک ارسال واقعی به تلگرام با توکن واقعی و یک پاسخ واقعی provider هنوز تأیید نشده چون به مقداردهی واقعی `.env` نیاز دارد.
+- تایید اینکه آستانه پیش‌فرض `MIN_IMPORTANCE_TO_SEND=low` (ارسال همه پست‌های مرتبط) مطلوب است یا کاربر از ابتدا می‌خواهد سخت‌گیرتر باشد (`medium`/`high`). **باز است**؛ در README مسیر تغییر یک‌خطی‌اش توضیح داده شده است.
 
 ---
 
@@ -520,3 +509,8 @@ pytest
   همچنین **فهرست واقعی موضوعات/فیدها** (بخش ۱۵ و `config/topics.yaml`) تکمیل شد: دو ساب‌ردیت کم‌ترافیک که ترافیک‌شان روی فید زنده اندازه‌گیری شد (`r/mlops` ≈۳ پست/روز، `r/venturecapital` ≈۰.۴ پست/روز؛ در مقایسه `r/deeplearning` ≈۱۳ و `r/learnmachinelearning` ≈۴۸). دلیل: با API رایگان و `HTTP_MAX_RETRIES` محدود، حجم هر دور باید قابل پیش‌بینی بماند. نکتهٔ عملیاتی که در همین اندازه‌گیری دیده شد: فیدهای `.rss` ریدیت به‌ازای IP محدود می‌شوند (۴۲۹ روی چند فید پشت‌سرهم)، پس با `POLL_INTERVAL_SECONDS` پیش‌فرض (۹۰۰) که فقط چند درخواست در هر دور دارد مسئله‌ای نیست، و اگر فیدی رد شود فقط همان فید در آن دور skip می‌شود (Invariant 8).
   سایر تغییرات همین فاز: تست `tests/test_pipeline_integration.py` (دو دور متوالی `run_once()` روی Postgres واقعی و بایت‌های واقعی یک فید capture‌شده، با اثبات صریح Invariantهای ۱، ۷ و ۱۰)، تست `tests/test_llm_client.py` (پیش‌تر `llm_client` هیچ پوشش مستقیمی نداشت)، نمونهٔ واقعی فید در `tests/fixtures/reddit_learnmachinelearning.rss` (فیکسچرهای دست‌نویس از سند واقعی فاصله گرفته بودند: ریدیت تگ `r/<name>` را نمی‌فرستد و کل فید در یک خط می‌آید)، و یک نکتهٔ تست‌پذیری در `call_with_retries`: پارامتر `sleep` دیگر در زمان تعریف bind نمی‌شود و مثل `retryable` در زمان فراخوانی resolve می‌شود تا تست‌ها واقعاً نخوابند. هیچ Invariant‌ای تغییر نکرد، `db/schema.sql` دست‌نخورده است و هیچ وابستگی جدیدی اضافه نشد.
 - **۲۰۲۶-۰۹-۲۸ (فاز ۴ — وضعیت تأیید)**: دیتابیس واقعی، parse واقعی فید ریدیت، نوشتن رکورد و تصمیم‌گیری status/`sent_at`، چند دور polling متوالی `worker` بدون کرش، و خروج تمیز روی `docker stop` (SIGTERM → کد خروج ۰ در کمتر از یک ثانیه) همه در Docker واقعاً اجرا و تأیید شدند. آنچه هنوز تأیید نشده: یک ارسال واقعی به تلگرام با توکن واقعی و یک پاسخ واقعی از provider مدل — این دو مورد در بخش ۱۵ باقی می‌مانند و به مقداردهی واقعی `.env` نیاز دارند.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۴ — تکمیل MVP: پوشش تست، README نهایی، ممیزی مستند/کد)** — سه تصمیم:
+  1. **مستندات به یک آرتیفکت تست‌شده تبدیل شد (اجرای خودکار Invariant 11)**: `tests/test_docs_consistency.py` اضافه شد و دامنهٔ فایل‌های Python بخش ۹، نام‌گذاری APIهای همان بخش، ستون‌ها و statusهای بخش ۱۰، پارامترهای بخش ۱۱ و فهرست `config/topics.yaml` را با خودِ کد/فایل‌ها مقایسه می‌کند. دلیل: قانون بخش ۱۴ تا پیش از این فقط به «حسن نیت» تکیه داشت و همین ممیزی سه مغایرت واقعی پیدا کرد (`topic_display_names` و `format_message` در بخش ۹ مستند نشده بودند و مثال `topics.yaml` در بخش ۱۱ هنوز فهرست نمونهٔ قدیمی را نشان می‌داد). از این پس drift مستندات، تست را می‌شکند نه اینکه منتظر ممیزی بعدی بماند.
+  2. **رنج تعداد `key_points` (۲ تا ۵ در FR-8) در prompt اعمال می‌شود، نه در اعتبارسنجی**: بخش‌های ۵ و ۱۲ همین سند هم به همین شکل اصلاح شدند. دلیل: Invariant 3 باید خروجی *غیرقابل‌اعتماد* را رد کند، و «۶ نکته» غیرقابل‌اعتماد نیست؛ سخت‌گیری این‌جا یک پست معتبر را `failed` می‌کرد و خلاصهٔ مفید را از دست می‌داد.
+  3. **README به راهنمای کاربر نهایی و خودکفا تبدیل شد** (پیش‌نیازها، تنظیم `OPENAI_*`/تلگرام، تأیید کارکرد، افزودن ساب‌ردیت/موضوع، توقف، عیب‌یابی) و عمداً FR/NFR/Invariant و نقشهٔ ماژول‌ها را تکرار نمی‌کند بلکه به بخش‌های ۵، ۷، ۹، ۱۱ و ۱۲ همین سند ارجاع می‌دهد (DRY).
+  همچنین در همین فاز پوشش تست مسیرهای خطای جامانده تکمیل شد: فید بدون `published_at` و فید بدون پاسخ (timeout) در `reddit_source`، رفتار `save()` روی `reddit_id` تکراری و بدون بازنویسی تحلیل قبلی در `repository`، شکست API بعد از تمام تلاش‌ها/پاسخ بدون `choices`/بودجهٔ یک‌تلاشی در `llm_client`، و مرزهای `truncate` و رندر هر تعداد نکته در `formatting`. سقف‌های عددی (مثل `len(columns) == 20`) هم داخل تست‌های ممیزی گذاشته شد تا اگر regex خالی برگرداند، تست به‌جای سبز شدنِ الکی شکست بخورد. هیچ Invariant‌ای تغییر نکرد، `db/schema.sql` و `config/topics.yaml` دست‌نخورده ماندند (فهرست فیدها در فاز ۴-A نهایی شد) و هیچ وابستگی جدیدی اضافه نشد.
