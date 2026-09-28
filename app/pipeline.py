@@ -10,6 +10,7 @@ Order per run:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
@@ -19,9 +20,13 @@ from app.formatting import format_post_message
 from app.models import IMPORTANCE_ORDER, LlmAnalysis, PostRecord, PostStatus, RawPost
 from app.reddit_source import TopicsConfig, fetch_all, topic_display_names
 from app.settings import Settings
-from app.telegram_notifier import TelegramNotifier
+from app.telegram_notifier import send_message as telegram_send_message
 
 logger = logging.getLogger(__name__)
+
+# The notifier seam: any callable that takes the message text and reports whether
+# Telegram accepted it. Defaults to the real ``app.telegram_notifier.send_message``.
+SendMessage = Callable[[str], bool]
 
 
 def meets_importance_threshold(importance: str | None, minimum: str) -> bool:
@@ -87,11 +92,12 @@ class Pipeline:
         self,
         *,
         settings: Settings,
-        notifier: TelegramNotifier,
         topics_config: TopicsConfig,
+        send_message: SendMessage | None = None,
     ) -> None:
         self._settings = settings
-        self._notifier = notifier
+        # The notifier reads its own settings/env (FR-10), so only the seam is injected.
+        self._send_message = send_message or telegram_send_message
         self._topics_config = topics_config
         # The analyzer takes the topic objects themselves (key + Persian name).
         self._topics = list(topics_config.topics)
@@ -123,9 +129,11 @@ class Pipeline:
         for record in pending:
             try:
                 self._send(record)
-            except Exception as exc:
-                logger.error(
-                    "Pending send still failing for reddit_id=%s: %s", record.reddit_id, exc
+            except Exception:
+                # Unexpected only: a rejected send returns False instead (Invariant 8).
+                logger.exception(
+                    "Unexpected failure while retrying the send of reddit_id=%s; continuing",
+                    record.reddit_id,
                 )
 
     def process_post(self, post: RawPost) -> None:
@@ -176,9 +184,9 @@ class Pipeline:
 
         try:
             self._send(record.model_copy(update={"id": post_id}))
-        except Exception as exc:
+        except Exception:
             # The row stays 'to_send' and FR-11 retries it on the next run.
-            logger.error("Sending failed for reddit_id=%s: %s", post.reddit_id, exc)
+            logger.exception("Sending failed for reddit_id=%s; continuing", post.reddit_id)
 
     @staticmethod
     def _resolve_duplicate(
@@ -198,12 +206,22 @@ class Pipeline:
             record.source_topic_key
         )
 
-    def _send(self, record: PostRecord) -> None:
-        """Format and send one stored post, then mark it as sent (FR-10)."""
+    def _send(self, record: PostRecord) -> bool:
+        """Format and send one stored post; mark it ``sent`` only on success (FR-10).
+
+        Returns whether the message went out. A rejection is not an exception any more:
+        the row simply stays ``to_send`` and FR-11 retries it on the next run.
+        """
         if record.id is None:
             raise ValueError("refusing to send a post that was never stored (Invariant 2)")
 
-        self._notifier.send_message(
-            format_post_message(record, topic_name=self._topic_label(record))
-        )
+        text = format_post_message(record, topic_name=self._topic_label(record))
+        if not self._send_message(text):
+            logger.error(
+                "Telegram rejected the message for reddit_id=%s; keeping status='to_send'",
+                record.reddit_id,
+            )
+            return False
+
         repository.update_status(record.id, "sent", datetime.now(timezone.utc))
+        return True

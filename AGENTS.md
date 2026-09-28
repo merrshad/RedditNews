@@ -234,7 +234,7 @@ reddit-telegram-digest/
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
 │   ├── analyzer.py            # ساخت prompt، فراخوانی chat_completion، اعتبارسنجی → analyze()/AnalysisError → FR-3..FR-8
-│   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده → FR-10
+│   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
 │   └── pipeline.py            # orchestration: اتصال همه ماژول‌های بالا به هم
@@ -244,12 +244,15 @@ reddit-telegram-digest/
     ├── test_repository.py
     ├── test_analyzer.py
     ├── test_formatting.py
+    ├── test_telegram_notifier.py
     └── test_pipeline.py
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
 
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
+
+`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` دیگر نوتيفایر نمی‌سازد و `Pipeline` فقط یک seam قابل‌تزریق با پیش‌فرض همین تابع دارد.
 
 ---
 
@@ -463,3 +466,10 @@ pytest
   4. **کاندیدهای شباهت از `SimilarityCandidate` به `PostRecord` تغییر کردند** (بخش ۹): مدل جداگانه حذف شد تا امضای `analyze` با داده‌ی واقعی جدول یکی باشد.
   5. **`llm_raw_response` اکنون JSON اعتبارسنجی‌شده‌ی تحلیل را نگه می‌دارد** (بخش ۵، FR-9): چون `analyze` فقط `LlmAnalysis` برمی‌گرداند، خروجی خام در دسترس پایپ‌لاین نیست.
   6. **`topic` در `LlmAnalysis` اجباری شد** (بخش ۵، FR-3/FR-5): خروجی LLM همیشه باید یکی از کلیدهای مجاز `config/topics.yaml` را برگرداند.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — اطلاع‌رسانی تلگرام)** — `telegram_notifier` از کلاس `TelegramNotifier` به تابع ماژول‌سطح `send_message(text) -> bool` تبدیل شد (هم‌سبک با `repository`/`llm_client`، بخش ۹). دلایل و اثرها:
+  1. **اقتدار تصمیم به `pipeline` برگشت** (FR-10/FR-11): شکست عادی (رد شدن پیام یا اتمام `HTTP_MAX_RETRIES`) دیگر `TelegramError` بیرون نمی‌دهد و `False` برمی‌گرداند؛ فقط خطای واقعاً غیرمنتظره بالا می‌رود و همان گارد موجود `pipeline` آن را می‌گیرد. نتیجه: رکورد در `sent` یا `to_send` ماندن، یک تصمیم صریح در `pipeline` است نه استثناء.
+  2. **حذف حالت و تزریق‌پذیری**: توکن/چت از `get_settings()` در زمان فراخوانی خوانده می‌شوند، پس `main.py` دیگر `build_notifier` ندارد و `Pipeline` فقط پارامتر `send_message` (با پیش‌فرض تابع واقعی) را می‌گیرد — تست‌ها بدون monkeypatch شبکه، یک fake قابل‌فراخوانی تزریق می‌کنند (NFR-8).
+  3. **`disable_web_page_preview: false`** طبق خواسته صریح کاربر (قبلاً `true` بود) تا پیش‌نمایش لینک پست در تلگرام نمایش داده شود.
+  4. **پیام بلندتر از ۴۰۹۶ کاراکتر فقط در سطح `WARNING` لاگ می‌شود و دست‌نخورده ارسال می‌شود**؛ کوتاه‌سازی همچنان مسئولیت `formatting.py` است (FR-10) — تفکیک مسئولیت‌ها حفظ شد.
+  5. **retry روی تابع داخلی `_send_message_once`** با دکوریتور `retryable` اعمال می‌شود (نه روی `send_message`)، چون تنها همان لایه است که شکست را raise می‌کند تا backoff معنا داشته باشد؛ پیام‌های خطا همچنان پاک‌سازی‌شده‌اند تا توکن هرگز در لاگ نیفتد (Invariant 6، NFR-4).
+  6. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.

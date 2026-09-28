@@ -16,7 +16,6 @@ from app.pipeline import (
 )
 from app.reddit_source import TopicsConfig
 from app.settings import Settings
-from app.telegram_notifier import TelegramError
 from tests.conftest import (
     TEST_REDDIT_ID_PREFIX,
     FakeChatCompletion,
@@ -62,21 +61,34 @@ def _pending(post_id: int = 5) -> PostRecord:
     )
 
 
-class FakeNotifier:
-    def __init__(self) -> None:
-        self.messages: list[str] = []
-        self.fail_first = False
+class FakeSender:
+    """Stand-in for ``app.telegram_notifier.send_message`` (NFR-8: no network).
 
-    def send_message(self, text: str, **kwargs: object) -> None:
+    It mirrors the real contract — text in, ``True`` only when Telegram accepted the
+    message — so a rejected send comes back as ``False`` and the pipeline keeps the
+    post as ``to_send`` for the next run (FR-10/FR-11).
+    """
+
+    def __init__(self, *, accept: bool = True, fail_first: bool = False) -> None:
+        self.accept = accept
+        self.fail_first = fail_first
+        self.messages: list[str] = []
+
+    def __call__(self, text: str) -> bool:
         if self.fail_first:
             self.fail_first = False
-            raise TelegramError("sendMessage rejected")
+            return False
+        if not self.accept:
+            return False
         self.messages.append(text)
+        return True
 
 
-class FailingNotifier(FakeNotifier):
-    def send_message(self, text: str, **kwargs: object) -> None:
-        raise TelegramError("sendMessage rejected")
+class FailingSender(FakeSender):
+    """A notifier that always reports a rejected send (Telegram is down)."""
+
+    def __init__(self) -> None:
+        super().__init__(accept=False)
 
 
 def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
@@ -105,21 +117,21 @@ def _harness(
     topics_config: TopicsConfig,
     repository: FakeRepository | None = None,
     answer: str = json.dumps(VALID_ANSWER, ensure_ascii=False),
-    notifier: FakeNotifier | None = None,
+    sender: FakeSender | None = None,
     llm: FakeChatCompletion | None = None,
-) -> tuple[Pipeline, FakeRepository, FakeNotifier]:
-    """A pipeline wired to an in-memory storage fake and a stubbed LLM transport."""
+) -> tuple[Pipeline, FakeRepository, FakeSender]:
+    """A pipeline wired to in-memory storage/Telegram fakes and a stubbed LLM transport."""
     llm = llm if llm is not None else FakeChatCompletion()
     llm.answer = answer
     _install_llm(monkeypatch, llm)
     repository = patch_repository(monkeypatch, repository or FakeRepository())
-    notifier = notifier if notifier is not None else FakeNotifier()
+    sender = sender if sender is not None else FakeSender()
     pipeline = Pipeline(
         settings=settings,
-        notifier=notifier,  # type: ignore[arg-type]
         topics_config=topics_config,
+        send_message=sender,
     )
-    return pipeline, repository, notifier
+    return pipeline, repository, sender
 
 
 @pytest.fixture(autouse=True)
@@ -186,7 +198,7 @@ def test_build_post_record_for_the_failed_path_keeps_raw_post_fields() -> None:
 def test_run_once_skips_a_post_that_is_already_stored(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
@@ -197,13 +209,13 @@ def test_run_once_skips_a_post_that_is_already_stored(
 
     assert repository.saved == []
     assert repository.calls == ["fetch_pending_to_send", "exists"]
-    assert notifier.messages == []
+    assert sender.messages == []
 
 
 def test_run_once_stores_irrelevant_posts_without_sending(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
@@ -216,7 +228,7 @@ def test_run_once_stores_irrelevant_posts_without_sending(
     pipeline.run_once()
 
     assert [record.status for record in repository.saved] == ["skipped_irrelevant"]
-    assert notifier.messages == []
+    assert sender.messages == []
     assert repository.updates == []
 
 
@@ -232,7 +244,7 @@ def test_run_once_maps_a_duplicate_index_to_the_real_database_id(
         url="https://example.com/prev",
         summary_fa="خلاصه",
     )
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
@@ -244,13 +256,13 @@ def test_run_once_maps_a_duplicate_index_to_the_real_database_id(
 
     assert repository.saved[0].duplicate_of_id == 77
     assert repository.saved[0].status == "skipped_duplicate"
-    assert notifier.messages == []
+    assert sender.messages == []
 
 
 def test_run_once_sends_a_qualifying_post_only_after_storing_it(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch, settings=settings, topics_config=topics_config
     )
 
@@ -262,9 +274,9 @@ def test_run_once_sends_a_qualifying_post_only_after_storing_it(
         VALID_ANSWER
     ).model_dump(mode="json")
     assert repository.sent_ids == [repository.last_id]
-    assert len(notifier.messages) == 1
-    assert "خلاصه فارسی پست." in notifier.messages[0]
-    assert "• نکته اول" in notifier.messages[0]
+    assert len(sender.messages) == 1
+    assert "خلاصه فارسی پست." in sender.messages[0]
+    assert "• نکته اول" in sender.messages[0]
     assert repository.calls.index("save") < repository.calls.index("update_status")
 
 
@@ -283,7 +295,7 @@ def test_run_once_passes_the_configured_lookback_limits(
 def test_run_once_respects_a_higher_importance_threshold(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings.model_copy(update={"min_importance_to_send": "high"}),
         topics_config=topics_config,
@@ -293,13 +305,13 @@ def test_run_once_respects_a_higher_importance_threshold(
     pipeline.run_once()
 
     assert [record.status for record in repository.saved] == ["skipped_low_importance"]
-    assert notifier.messages == []
+    assert sender.messages == []
 
 
 def test_run_once_records_failed_status_for_invalid_llm_output(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch, settings=settings, topics_config=topics_config, answer="sorry, no json"
     )
 
@@ -307,7 +319,7 @@ def test_run_once_records_failed_status_for_invalid_llm_output(
 
     assert [record.status for record in repository.saved] == ["failed"]
     assert repository.saved[0].llm_raw_response is None
-    assert notifier.messages == []
+    assert sender.messages == []
 
 
 def test_run_once_leaves_the_post_unstored_when_the_llm_call_itself_fails(
@@ -317,8 +329,8 @@ def test_run_once_leaves_the_post_unstored_when_the_llm_call_itself_fails(
     repository = patch_repository(monkeypatch, FakeRepository())
     pipeline = Pipeline(
         settings=settings,
-        notifier=FakeNotifier(),  # type: ignore[arg-type]
         topics_config=topics_config,
+        send_message=FakeSender(),
     )
 
     pipeline.run_once()
@@ -354,7 +366,7 @@ def test_run_once_retries_pending_sends_without_re_analysing(
     monkeypatch.setattr(
         "app.pipeline.fetch_all", lambda topics_config: fetched.append("fetch") or []
     )
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
@@ -365,7 +377,7 @@ def test_run_once_retries_pending_sends_without_re_analysing(
     pipeline.run_once()
 
     assert repository.sent_ids == [5]
-    assert "خلاصه پست معلق." in notifier.messages[0]
+    assert "خلاصه پست معلق." in sender.messages[0]
     assert repository.calls.index("fetch_pending_to_send") < repository.calls.index("update_status")
     assert fetched == ["fetch"]
     assert llm.calls == []  # FR-11: no second LLM call
@@ -378,7 +390,7 @@ def test_run_once_keeps_a_failed_send_as_to_send(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
-        notifier=FailingNotifier(),
+        sender=FailingSender(),
     )
 
     pipeline.run_once()  # must not raise
@@ -391,35 +403,34 @@ def test_run_once_continues_with_the_next_pending_send_after_a_failure(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
     monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [])
-    notifier = FakeNotifier()
-    notifier.fail_first = True
-    pipeline, repository, notifier = _harness(
+    sender = FakeSender(fail_first=True)
+    pipeline, repository, sender = _harness(
         monkeypatch,
         settings=settings,
         topics_config=topics_config,
         repository=FakeRepository(pending=(_pending(5), _pending(6))),
-        notifier=notifier,
+        sender=sender,
     )
 
     pipeline.run_once()
 
     assert repository.sent_ids == [6]
-    assert len(notifier.messages) == 1
-    assert "Pending post 6" in notifier.messages[0]
+    assert len(sender.messages) == 1
+    assert "Pending post 6" in sender.messages[0]
 
 
 def test_send_refuses_a_post_that_was_never_stored(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
 ) -> None:
     """Invariant 2 — sending before storing must be impossible."""
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch, settings=settings, topics_config=topics_config
     )
 
     with pytest.raises(ValueError, match="never stored"):
         pipeline._send(_pending(5).model_copy(update={"id": None}))
 
-    assert notifier.messages == []
+    assert sender.messages == []
     assert repository.updates == []
 
 
@@ -430,7 +441,7 @@ def test_run_once_wires_real_modules_end_to_end(
     from tests.test_reddit_source import SAMPLE_FEED
 
     monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: SAMPLE_FEED.encode())
-    pipeline, repository, notifier = _harness(
+    pipeline, repository, sender = _harness(
         monkeypatch, settings=settings, topics_config=topics_config
     )
 
@@ -444,7 +455,7 @@ def test_run_once_wires_real_modules_end_to_end(
     assert stored.importance == "high"
     assert stored.key_points == ["نکته اول"]
 
-    message = notifier.messages[0]
+    message = sender.messages[0]
     assert "A new open model was released" in message
     assert "🗂 موضوع: هوش مصنوعی" in message
     assert "⭐ اهمیت: زیاد" in message
@@ -485,11 +496,11 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
         monkeypatch, FakeChatCompletion(json.dumps(VALID_ANSWER, ensure_ascii=False))
     )
 
-    def build(notifier: FakeNotifier) -> Pipeline:
+    def build(sender: FakeSender) -> Pipeline:
         return Pipeline(
             settings=settings,
-            notifier=notifier,  # type: ignore[arg-type]
             topics_config=topics_config,
+            send_message=sender,
         )
 
     def stored_rows() -> list[dict]:
@@ -502,7 +513,7 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
             return cursor.fetchall()
 
     # First run: Telegram is down, but both analysed posts are already stored (Invariant 2).
-    build(FailingNotifier()).run_once()
+    build(FailingSender()).run_once()
 
     assert [row["status"] for row in stored_rows()] == ["to_send", "to_send"]
     assert all(row["sent_at"] is None for row in stored_rows())
@@ -510,11 +521,11 @@ def test_a_failed_send_is_recovered_from_the_database_on_the_next_run(
 
     # Second run: no new RSS items, so only the pending rows are retried (FR-11).
     monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [])
-    working_notifier = FakeNotifier()
-    build(working_notifier).run_once()
+    working_sender = FakeSender()
+    build(working_sender).run_once()
 
     assert [row["status"] for row in stored_rows()] == ["sent", "sent"]
     assert all(row["sent_at"] is not None for row in stored_rows())
     assert len(llm.calls) == 2  # never re-analysed
-    assert len(working_notifier.messages) == 2
-    assert "خلاصه فارسی پست." in working_notifier.messages[0]
+    assert len(working_sender.messages) == 2
+    assert "خلاصه فارسی پست." in working_sender.messages[0]
