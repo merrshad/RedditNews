@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
 
-from app import pipeline
+from app import pipeline, repository
 from app.models import LlmAnalysis, PostRecord, RawPost
 from app.pipeline import (
     build_post_record,
@@ -616,3 +617,227 @@ def test_a_rejected_send_is_recovered_from_the_database_on_the_next_run(
     assert len(working_sender.messages) == 1
     assert "خلاصه فارسی پست." in working_sender.messages[0]
     assert sender.messages == []
+
+
+def _patch_http_seams(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    posts: list[RawPost],
+    sender: FakeSender | None = None,
+    llm: Callable[[str, str], str] | None = None,
+) -> FakeSender:
+    """Patch only the HTTP boundaries; ``app.repository`` stays real (Postgres).
+
+    ``_patch_seams`` already injects the settings, the topics config and the notifier;
+    this adds the RSS items and deliberately leaves the repository untouched, so every
+    row really goes through ``db/schema.sql``.
+    """
+    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: list(posts))
+    sender, _ = _patch_seams(
+        monkeypatch, settings=settings, topics_config=topics_config, sender=sender, llm=llm
+    )
+    return sender  # type: ignore[return-value]
+
+
+def _row_for(connection: psycopg.Connection, reddit_id: str) -> dict:
+    """The stored row for one ``reddit_id`` (asserts that it exists)."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT reddit_id, status, sent_at, is_relevant, duplicate_of_id, importance "
+            "FROM posts WHERE reddit_id = %s",
+            (reddit_id,),
+        )
+        row = cursor.fetchone()
+    assert row is not None, f"no stored row for reddit_id={reddit_id}"
+    return row
+
+
+def _insert_candidate(
+    connection: psycopg.Connection, *, post_id: int, reddit_id: str, published_at: datetime
+) -> None:
+    """Seed one analysed row so the real ``fetch_recent_candidates`` can find it.
+
+    The id is set explicitly so a mapping test can prove the 1-based index really became
+    *that* row's id rather than the index value itself.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO posts (
+                id, reddit_id, subreddit, source_topic_key, title, url, published_at,
+                is_relevant, topic, importance, summary_fa, key_points, status
+            ) VALUES (
+                %s, %s, 'MachineLearning', 'ai', %s, %s, %s,
+                TRUE, 'ai', 'medium', %s, '[]'::jsonb, 'sent'
+            )
+            """,
+            (
+                post_id,
+                reddit_id,
+                f"Candidate {reddit_id}",
+                f"https://example.com/{reddit_id}",
+                published_at,
+                f"خلاصه {reddit_id}",
+            ),
+        )
+
+
+def test_real_db_sends_a_new_relevant_post_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """FR-9 + FR-10 with real Postgres: store the row, then send exactly one message."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_new"
+    llm = FakeChatCompletion(VALID_JSON)
+    sender = _patch_http_seams(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        llm=llm,
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "sent"
+    assert row["sent_at"] is not None
+    assert row["is_relevant"] is True
+    assert row["duplicate_of_id"] is None
+    assert len(llm.calls) == 1
+    assert len(sender.messages) == 1
+
+
+def test_real_db_a_second_run_does_not_reanalyse_or_resend(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 1 with real Postgres: the stored ``reddit_id`` short-circuits the next run."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_stored"
+    llm = FakeChatCompletion(VALID_JSON)
+    sender = _patch_http_seams(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        llm=llm,
+    )
+
+    pipeline.run_once()
+    assert len(llm.calls) == 1
+
+    pipeline.run_once()  # the feed still returns the same item
+
+    assert len(llm.calls) == 1  # repository.exists() short-circuits before the LLM
+    assert len(sender.messages) == 1
+    assert repository.fetch_pending_to_send() == []
+    assert _row_for(db_connection, reddit_id)["status"] == "sent"
+
+
+def test_real_db_maps_a_duplicate_index_to_the_real_candidate_id(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 4 with real Postgres: candidate #2 becomes that row's id, never the number 2."""
+    now = datetime.now(timezone.utc)
+    first_id, second_id = 771001, 771002
+    _insert_candidate(
+        db_connection,
+        post_id=first_id,
+        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_a",
+        published_at=now - timedelta(hours=1),
+    )
+    _insert_candidate(
+        db_connection,
+        post_id=second_id,
+        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_b",
+        published_at=now - timedelta(hours=2),
+    )
+
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_dup"
+    answer = json.dumps({**VALID_ANSWER, "duplicate_of_candidate_index": 2}, ensure_ascii=False)
+    sender = _patch_http_seams(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        llm=FakeChatCompletion(answer),
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "skipped_duplicate"
+    assert row["duplicate_of_id"] == second_id
+    assert row["duplicate_of_id"] != 2
+    assert sender.messages == []
+
+
+def test_real_db_stores_a_low_importance_post_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """FR-10(c) with real Postgres: kept and labelled, never sent, never left pending."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_low"
+    answer = json.dumps({**VALID_ANSWER, "importance": "low"}, ensure_ascii=False)
+    sender = _patch_http_seams(
+        monkeypatch,
+        settings=settings.model_copy(update={"min_importance_to_send": "medium"}),
+        topics_config=topics_config,
+        posts=[_post(reddit_id)],
+        llm=FakeChatCompletion(answer),
+    )
+
+    pipeline.run_once()
+
+    row = _row_for(db_connection, reddit_id)
+    assert row["status"] == "skipped_low_importance"
+    assert row["is_relevant"] is True
+    assert row["importance"] == "low"
+    assert row["sent_at"] is None
+    assert sender.messages == []
+    assert repository.fetch_pending_to_send() == []  # nothing for FR-11 either
+
+
+def test_real_db_records_failed_and_keeps_processing_the_next_post(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    topics_config: TopicsConfig,
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariants 3 + 8 with real Postgres: a bad answer is stored as ``failed``, the run goes on."""
+    broken = f"{TEST_REDDIT_ID_PREFIX}pipeline_broken"
+    fine = f"{TEST_REDDIT_ID_PREFIX}pipeline_fine"
+    sender = _patch_http_seams(
+        monkeypatch,
+        settings=settings,
+        topics_config=topics_config,
+        posts=[_post(broken, title="Broken post"), _post(fine, title="Good post")],
+        llm=_answering_by_title(
+            {"Broken post": "sorry, no json", "Good post": VALID_JSON}
+        ),
+    )
+
+    pipeline.run_once()
+
+    broken_row = _row_for(db_connection, broken)
+    assert broken_row["status"] == "failed"
+    assert broken_row["is_relevant"] is None
+    assert broken_row["sent_at"] is None
+
+    fine_row = _row_for(db_connection, fine)
+    assert fine_row["status"] == "sent"
+    assert fine_row["sent_at"] is not None
+
+    assert len(sender.messages) == 1
+    assert "Good post" in sender.messages[0]
