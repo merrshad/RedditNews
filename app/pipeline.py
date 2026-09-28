@@ -10,23 +10,16 @@ Order per run:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from app import repository
 from app.analyzer import LlmOutputError, analyze_post, load_system_prompt
 from app.formatting import format_post_message
 from app.llm_client import LlmClient
-from app.models import (
-    IMPORTANCE_ORDER,
-    AnalyzedPost,
-    LlmAnalysis,
-    PostRecord,
-    PostStatus,
-    RawPost,
-    SimilarityCandidate,
-)
-from app.reddit_source import fetch_posts
-from app.repository import PostRepository
-from app.settings import Settings, TopicConfig, topic_display_names
+from app.models import IMPORTANCE_ORDER, LlmAnalysis, PostRecord, PostStatus, RawPost
+from app.reddit_source import TopicsConfig, fetch_all, topic_display_names
+from app.settings import Settings
 from app.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -55,16 +48,20 @@ def determine_status(
     return "to_send"
 
 
-def build_analyzed_post(
+def build_post_record(
     post: RawPost,
     *,
     status: PostStatus,
     analysis: LlmAnalysis | None = None,
     duplicate_of_id: int | None = None,
     raw_response: dict[str, Any] | None = None,
-) -> AnalyzedPost:
-    """Flatten a raw post (+ optional analysis) into the row to insert (FR-9)."""
-    return AnalyzedPost(
+) -> PostRecord:
+    """Flatten a raw post (+ optional analysis) into the row to store (FR-9).
+
+    Used both for analysed posts and for rows recorded as ``failed`` because the LLM
+    answer was invalid (Invariant 3); ``id`` stays ``None`` until ``repository.save``.
+    """
+    return PostRecord(
         reddit_id=post.reddit_id,
         subreddit=post.subreddit,
         source_topic_key=post.source_topic_key,
@@ -84,16 +81,6 @@ def build_analyzed_post(
     )
 
 
-def to_post_record(analyzed: AnalyzedPost, post_id: int) -> PostRecord:
-    """Build the in-memory record that is formatted and sent after storing."""
-    fields = set(PostRecord.model_fields) - {"id", "status"}
-    return PostRecord(
-        id=post_id,
-        status=analyzed.status,
-        **analyzed.model_dump(include=fields),
-    )
-
-
 class Pipeline:
     """Wires the modules together; holds no I/O logic of its own beyond orchestration."""
 
@@ -101,19 +88,17 @@ class Pipeline:
         self,
         *,
         settings: Settings,
-        repository: PostRepository,
         llm_client: LlmClient,
         notifier: TelegramNotifier,
-        topics: Sequence[TopicConfig],
+        topics_config: TopicsConfig,
         system_prompt: str | None = None,
     ) -> None:
         self._settings = settings
-        self._repository = repository
         self._llm_client = llm_client
         self._notifier = notifier
-        self._topics = list(topics)
-        self._allowed_topics = [topic.key for topic in self._topics]
-        self._topic_names = topic_display_names(self._topics)
+        self._topics_config = topics_config
+        self._allowed_topics = [topic.key for topic in topics_config.topics]
+        self._topic_names = topic_display_names(topics_config.topics)
         self._system_prompt = system_prompt if system_prompt is not None else load_system_prompt()
 
     def run_once(self) -> None:
@@ -121,7 +106,7 @@ class Pipeline:
         logger.info("Pipeline run started")
         self.retry_pending_sends()
 
-        posts = fetch_posts(self._topics, max_retries=self._settings.http_max_retries)
+        posts = fetch_all(self._topics_config)
         for post in posts:
             try:
                 self.process_post(post)
@@ -135,7 +120,7 @@ class Pipeline:
 
     def retry_pending_sends(self) -> None:
         """FR-11 — finish sends from earlier runs without re-analysing them."""
-        pending = self._repository.fetch_pending_send()
+        pending = repository.fetch_pending_to_send()
         if not pending:
             return
         logger.info("Retrying %d pending send(s) from earlier runs", len(pending))
@@ -149,13 +134,13 @@ class Pipeline:
 
     def process_post(self, post: RawPost) -> None:
         """FR-2 -> FR-3..FR-8 -> FR-9 -> FR-10 for a single fetched post."""
-        if self._repository.exists(post.reddit_id):
+        if repository.exists(post.reddit_id):
             logger.info("reddit_id=%s already stored, skipping LLM call", post.reddit_id)
             return
 
-        candidates = self._repository.get_similarity_candidates(
-            limit=self._settings.similarity_lookback_limit,
-            hours=self._settings.similarity_lookback_hours,
+        candidates = repository.fetch_recent_candidates(
+            self._settings.similarity_lookback_limit,
+            self._settings.similarity_lookback_hours,
         )
 
         try:
@@ -169,13 +154,13 @@ class Pipeline:
         except LlmOutputError as exc:
             # Invariant 3: invalid output is recorded as failed, never assumed valid.
             logger.error("Invalid LLM output for reddit_id=%s: %s", post.reddit_id, exc)
-            self._repository.insert_post(
-                build_analyzed_post(post, status="failed", raw_response=exc.raw_response)
+            repository.save(
+                build_post_record(post, status="failed", raw_response=exc.raw_response)
             )
             return
         except Exception as exc:
-            # Transient LLM/network trouble: leave the post unfetched-in-DB so the next
-            # run analyses it again (no record, no send, no duplicate).
+            # Transient LLM/network trouble: leave the post unstored so the next run
+            # analyses it again (no record, no send, no duplicate).
             logger.error("LLM call failed for reddit_id=%s: %s", post.reddit_id, exc)
             return
 
@@ -185,7 +170,7 @@ class Pipeline:
             duplicate_of_id=duplicate_of_id,
             min_importance_to_send=self._settings.min_importance_to_send,
         )
-        analyzed = build_analyzed_post(
+        record = build_post_record(
             post,
             status=status,
             analysis=outcome.analysis,
@@ -194,19 +179,19 @@ class Pipeline:
         )
 
         # Invariant 2: store first, send only afterwards.
-        post_id = self._repository.insert_post(analyzed)
-        if post_id is None or status != "to_send":
+        post_id = repository.save(record)
+        if status != "to_send":
             return
 
         try:
-            self._send(to_post_record(analyzed, post_id))
+            self._send(record.model_copy(update={"id": post_id}))
         except Exception as exc:
             # The row stays 'to_send' and FR-11 retries it on the next run.
             logger.error("Sending failed for reddit_id=%s: %s", post.reddit_id, exc)
 
     @staticmethod
     def _resolve_duplicate(
-        analysis: LlmAnalysis, candidates: Sequence[SimilarityCandidate]
+        analysis: LlmAnalysis, candidates: Sequence[PostRecord]
     ) -> int | None:
         """Invariant 4 — map the LLM's local 1-based index to a real database id."""
         index = analysis.duplicate_of_candidate_index
@@ -223,8 +208,11 @@ class Pipeline:
         )
 
     def _send(self, record: PostRecord) -> None:
-        """Format and send one post, then mark it as sent (FR-10)."""
+        """Format and send one stored post, then mark it as sent (FR-10)."""
+        if record.id is None:
+            raise ValueError("refusing to send a post that was never stored (Invariant 2)")
+
         self._notifier.send_message(
             format_post_message(record, topic_name=self._topic_label(record))
         )
-        self._repository.mark_sent(record.id)
+        repository.update_status(record.id, "sent", datetime.now(timezone.utc))

@@ -11,8 +11,8 @@ import time
 
 from app.llm_client import LlmClient
 from app.pipeline import Pipeline
-from app.repository import PostRepository, connect
-from app.settings import Settings, TopicConfig, get_settings, load_topics
+from app.reddit_source import TopicsConfig, load_topics_config
+from app.settings import Settings, get_settings
 from app.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -50,32 +50,30 @@ def build_notifier(settings: Settings) -> TelegramNotifier:
 def run_once(
     settings: Settings,
     *,
-    topics: list[TopicConfig],
+    topics_config: TopicsConfig,
     llm_client: LlmClient,
     notifier: TelegramNotifier,
 ) -> None:
-    """Open a fresh connection and execute a single pipeline cycle."""
-    with connect(settings.database_url) as connection:
-        Pipeline(
-            settings=settings,
-            repository=PostRepository(connection),
-            llm_client=llm_client,
-            notifier=notifier,
-            topics=topics,
-        ).run_once()
+    """Execute a single pipeline cycle (the repository opens its own connections)."""
+    Pipeline(
+        settings=settings,
+        llm_client=llm_client,
+        notifier=notifier,
+        topics_config=topics_config,
+    ).run_once()
 
 
 def run_forever(
     settings: Settings,
     *,
-    topics: list[TopicConfig],
+    topics_config: TopicsConfig,
     llm_client: LlmClient,
     notifier: TelegramNotifier,
 ) -> None:
     """Poll forever; a failed cycle must never kill the worker (NFR-2)."""
     while True:
         try:
-            run_once(settings, topics=topics, llm_client=llm_client, notifier=notifier)
+            run_once(settings, topics_config=topics_config, llm_client=llm_client, notifier=notifier)
         except Exception:
             logger.exception("Pipeline cycle failed; retrying after the poll interval")
 
@@ -87,11 +85,11 @@ def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    topics = load_topics()
+    topics_config = load_topics_config()
     logger.info(
         "Starting reddit-telegram-digest: %d topic(s), %d feed(s), model=%s, interval=%ds",
-        len(topics),
-        sum(len(topic.feeds) for topic in topics),
+        len(topics_config.topics),
+        sum(len(topic.feeds) for topic in topics_config.topics),
         settings.openai_model,
         settings.poll_interval_seconds,
     )
@@ -100,7 +98,12 @@ def main() -> None:
     notifier = build_notifier(settings)
 
     try:
-        run_forever(settings, topics=topics, llm_client=llm_client, notifier=notifier)
+        run_forever(
+            settings,
+            topics_config=topics_config,
+            llm_client=llm_client,
+            notifier=notifier,
+        )
     except KeyboardInterrupt:
         logger.info("Shutdown requested, exiting")
 

@@ -2,6 +2,9 @@
 
 Invariant 3: the LLM output is *always* validated against :class:`LlmAnalysis`
 before anything else in the pipeline trusts it.
+
+Three models, one per stage of the data: the RSS item (:class:`RawPost`), the model
+answer (:class:`LlmAnalysis`) and the ``posts`` row (:class:`PostRecord`).
 """
 
 from __future__ import annotations
@@ -39,19 +42,6 @@ class RawPost(BaseModel):
     published_at: datetime | None = None
 
 
-class SimilarityCandidate(BaseModel):
-    """A recent, already-analysed post offered to the LLM as a duplicate candidate.
-
-    ``reddit_id``/``id`` are never shown to the LLM; only its 1-based position is
-    (Invariant 4).
-    """
-
-    id: int
-    reddit_id: str
-    title: str
-    summary_fa: str | None = None
-
-
 class LlmAnalysis(BaseModel):
     """Validated output of the single analysis LLM call (FR-3..FR-8)."""
 
@@ -74,13 +64,17 @@ class LlmAnalysis(BaseModel):
         return self
 
 
-class AnalyzedPost(BaseModel):
-    """One flat row for the atomic ``INSERT INTO posts`` (FR-9).
+class PostRecord(BaseModel):
+    """One ``posts`` row, from "built by the pipeline" to "read back from Postgres".
 
-    Used both for successfully analysed posts and for rows that must be recorded as
-    ``failed`` because the LLM output was invalid (Invariant 3).
+    The same model is used on both sides of the database: the pipeline fills it and
+    ``repository.save`` inserts it (``id`` is ``None`` until then), and the candidate
+    / pending-send queries map rows back into it. ``reddit_id``/``id`` are never sent
+    to the LLM, only the 1-based position of a candidate is (Invariant 4).
     """
 
+    # None until the row exists in Postgres.
+    id: int | None = None
     reddit_id: str
     subreddit: str
     source_topic_key: str
@@ -98,22 +92,4 @@ class AnalyzedPost(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     llm_raw_response: dict[str, Any] | None = None
 
-    status: PostStatus
-
-
-class PostRecord(BaseModel):
-    """A persisted post read back from Postgres (used for formatting/sending)."""
-
-    id: int
-    reddit_id: str
-    subreddit: str
-    source_topic_key: str
-    title: str
-    url: str
-    author: str | None = None
-    topic: str | None = None
-    importance: ImportanceLevel | None = None
-    summary_fa: str | None = None
-    key_points: list[str] = Field(default_factory=list)
-    published_at: datetime | None = None
     status: PostStatus = "new"
