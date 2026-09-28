@@ -183,6 +183,35 @@ def test_analyze_rejects_a_duplicate_index_when_no_candidate_was_sent(
         analyze(_post(), [], ALLOWED_TOPICS)
 
 
+def test_analyze_accepts_more_key_points_than_the_prompt_asks_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-8 asks the model for 2-5 bullets; the code deliberately does not enforce it.
+
+    The prompt is where the 2-5 range is stated, and this test pins the choice to stay
+    lenient here: rejecting the whole answer over a sixth bullet would turn a good post into
+    ``failed`` (Invariant 3) and lose the summary the reader wanted. ``formatting`` renders
+    whatever it is given and keeps the message inside Telegram's limit, so an over-eager
+    model costs a slightly longer message, not a lost post.
+    """
+    answer = {**VALID_ANSWER, "key_points": [f"نکته {index}" for index in range(1, 8)]}
+    _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
+
+    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+
+    assert len(analysis.key_points) == 7  # kept as-is, not truncated and not rejected
+
+
+def test_analyze_accepts_no_key_points_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other end of the range: an empty list is valid and simply renders no section."""
+    answer = {**VALID_ANSWER, "key_points": []}
+    _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
+
+    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+
+    assert analysis.key_points == []
+
+
 def test_analysis_error_keeps_the_parsed_answer_for_the_audit_column(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

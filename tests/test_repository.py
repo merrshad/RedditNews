@@ -140,6 +140,44 @@ def test_save_is_idempotent_for_the_same_reddit_id(db_connection: psycopg.Connec
     assert _row(db_connection, first)["summary_fa"] == "خلاصه اول"
 
 
+def test_save_never_overwrites_the_analysis_of_an_existing_row(
+    db_connection: psycopg.Connection,
+) -> None:
+    """Invariant 1 / NFR-1, the part a re-run could realistically get wrong.
+
+    `save` is an `INSERT ... ON CONFLICT DO NOTHING`, so a second analysis of the same
+    ``reddit_id`` cannot rewrite the stored verdict or move the row backwards: a post that
+    is already ``sent`` stays ``sent`` with its original ``sent_at`` and summary. The
+    pipeline avoids the call entirely via ``exists()`` (FR-2); this is the database-level
+    guarantee behind that shortcut.
+    """
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}no_overwrite"
+    sent_at = datetime.now(timezone.utc).replace(microsecond=0)
+    post_id = repository.save(
+        _record(reddit_id, status="to_send", importance="high", summary_fa="خلاصه اول")
+    )
+    repository.update_status(post_id, "sent", sent_at)
+
+    again = repository.save(
+        _record(
+            reddit_id,
+            status="to_send",
+            importance="low",
+            summary_fa="خلاصه دوم",
+            is_relevant=False,
+        )
+    )
+
+    assert again == post_id
+    assert _count(db_connection, reddit_id) == 1
+    row = _row(db_connection, post_id)
+    assert row["status"] == "sent"
+    assert row["sent_at"] == sent_at
+    assert row["importance"] == "high"
+    assert row["is_relevant"] is True
+    assert row["summary_fa"] == "خلاصه اول"
+
+
 def test_save_keeps_duplicate_of_id_pointing_at_another_row(db_connection: psycopg.Connection) -> None:
     original_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}original"))
 

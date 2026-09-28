@@ -1,70 +1,191 @@
 # reddit-telegram-digest
 
-سرویس پایتونی MVP که از فیدهای RSS ساب‌ردیت‌های تعریف‌شده پست جدید می‌گیرد، با **یک تماس LLM**
-هم‌زمان ربط، شباهت با پست‌های اخیر، موضوع، اهمیت، خلاصه فارسی و نکات کلیدی را استخراج می‌کند،
-نتیجه را در Postgres ذخیره می‌کند و پست‌های مناسب را به یک کانال/چت ثابت تلگرام broadcast می‌کند.
+سرویس کوچک و یک‌جهته‌ای که یک قلم موضوعی فارسی برایتان می‌سازد:
 
-> **منبع حقیقت این پروژه [`AGENTS.md`](./AGENTS.md) است.** این README فقط راهنمای سریع راه‌اندازی
-> است و عمداً BRD/FR/NFR/Invariantها را تکرار نمی‌کند (DRY).
+از فیدهای RSS یک یا چند ساب‌ردیت پست‌های تازه را می‌گیرد، با **یک تماس LLM** تصمیم می‌گیرد
+کدام‌شان به موضوع‌های شما مربوط است، آیا تکراری/مشابه پست‌های اخیر است و چقدر مهم است، یک
+خلاصهٔ فارسی با چند نکتهٔ کلیدی می‌سازد، همه‌چیز را در Postgres ذخیره می‌کند و پست‌های
+مناسب را به یک چت/کانال ثابت تلگرام می‌فرستد.
 
-## معماری در یک نگاه
+پیامی که در تلگرام می‌رسد چیزی شبیه این است:
 
 ```
-config/topics.yaml ─► reddit_source (RSS) ─► repository (بررسی تکراری در Postgres)
-        ─► analyzer + llm_client (یک تماس LLM: ربط/شباهت/موضوع/اهمیت/خلاصه/نکات)
-        ─► repository (ذخیره) ─► formatting + telegram_notifier (ارسال) ─► status=sent
+📌 <b>OpenAI releases a smaller reasoning model</b>
+r/mlops • هوش مصنوعی • اهمیت: بالا
+
+این مدل کوچک‌تر با هزینهٔ کمتر روی همان کارهای استدلالی اجرا می‌شود …
+
+🔑 نکات کلیدی:
+• حافظهٔ کمتر در زمان اجرا
+• دسترسی از طریق همان API قبلی
+
+🔗 https://www.reddit.com/r/mlops/comments/…
 ```
 
-هر اجرا ابتدا پست‌های باقی‌مانده با `status='to_send'` از اجرای قبلی را دوباره ارسال می‌کند
-(بازیابی پس از کرش، FR-11) و سپس فیدها را واکشی می‌کند.
+> **منبع حقیقت پروژه [`AGENTS.md`](./AGENTS.md) است** (معماری، نیازمندی‌ها، Invariantها و
+> قراردادهای کد). این README فقط راهنمای راه‌اندازی است و آن‌ها را عمداً تکرار نمی‌کند.
+
+---
+
+## پیش‌نیازها
+
+- **Docker** و **Docker Compose** (روی ویندوز/مک: Docker Desktop، و آن را اجرا کرده باشید).
+- یک **provider رایگان سازگار با OpenAI** (مثلاً Groq، OpenRouter، Together) و نام مدل آن.
+- یک **ربات تلگرام** (ساخت آن در BotFather با دستور `/newbot`، چند ثانیه طول می‌کشد).
+- برای اجرای تست‌ها: پایتون ۳.۱۱+ (اجرای خود سرویس به آن نیازی ندارد؛ داخل Docker می‌ماند).
 
 ## راه‌اندازی
 
+### ۱) فایل تنظیمات را بسازید
+
 ```bash
 cp .env.example .env
-# مقداردهی OPENAI_API_KEY, OPENAI_MODEL (و در صورت نیاز OPENAI_BASE_URL)،
-# TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID در .env
-# (اختیاری) افزودن ساب‌ردیت/موضوع بیشتر به config/topics.yaml
+```
 
-docker compose up --build
+`.env` هیچ‌وقت commit نمی‌شود (در `.gitignore` است) و رازها فقط از همین فایل خوانده می‌شوند.
+
+### ۲) مدل را معرفی کنید
+
+```env
+OPENAI_API_KEY=<کلید provider>
+OPENAI_BASE_URL=https://api.groq.com/openai/v1   # آدرس پایهٔ provider شما
+OPENAI_MODEL=<نام مدل دقیقاً همان‌طور که provider می‌نویسد>
+```
+
+### ۳) مقصد تلگرام را مشخص کنید
+
+1. در تلگرام به [@BotFather](https://t.me/BotFather) پیام بدهید، `/newbot` را بزنید و توکن را
+   در `TELEGRAM_BOT_TOKEN` بگذارید.
+2. یک پیام در چت/کانال مقصد بفرستید (**اول یک پیام، بعد خواندن شناسه**) — و اگر کانال است،
+   ربات را آن‌جا ادمین کنید.
+3. `TELEGRAM_CHAT_ID` را از این آدرس بردارید و مقدار `result[0].message.chat.id` را کپی کنید:
+
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+
+   اگر `result` خالی بود، یعنی هیچ پیامی برای ربات نیامده؛ دوباره پیام بفرستید.
+   برای کانال، شناسه با `-100` شروع می‌شود.
+
+### ۴) اجرا
+
+```bash
+docker compose up --build          # در پیش‌زمینه
+docker compose up --build -d       # یا در پس‌زمینه، و بعد:
+docker compose logs -f worker
 ```
 
 سرویس `db` (Postgres 16) در اولین بوت `db/schema.sql` را اعمال می‌کند و سرویس `worker`
-هر `POLL_INTERVAL_SECONDS` ثانیه یک دور کامل پایپ‌لاین اجرا می‌کند.
+هر `POLL_INTERVAL_SECONDS` ثانیه (پیش‌فرض ۹۰۰ = پانزده دقیقه) یک دور کامل را اجرا می‌کند.
 
-## تست‌ها
+**دور اول با بقیهٔ دورها فرق دارد:** دیتابیس هنوز خالی است، پس همهٔ آیتم‌هایی که در فید هستند
+(حداکثر ۲۵ آیتم در هر فید) تازه به‌حساب می‌آیند و همه تحلیل می‌شوند؛ یعنی دور اول چند دقیقه‌ای
+طول می‌کشد و ممکن است چند پیام پشت‌سرهم به تلگرام برود. از دور دوم به بعد فقط پست‌های تازه
+هستند (با فهرست فعلی، به‌طور میانگین حدود ۳ پست در روز) و هر دور چند ثانیه است.
+
+### ۵) مطمئن شوید کار می‌کند
+
+در لاگ `worker` این ترتیب را می‌بینید:
+
+```
+Feed https://www.reddit.com/r/mlops/new/.rss parsed: 25 item(s), 2 new in this batch
+Analyzed reddit_id=t3_1abcde relevant=True importance=high topic=ai duplicate_index=None
+Stored reddit_id=t3_1abcde as id=1 status=to_send
+Telegram message sent to chat <chat id> (742 chars)
+id=1 status -> sent
+```
+
+و برای دیدن وضعیت رکوردها در دیتابیس:
+
+```bash
+docker compose exec db psql -U postgres -d reddit_digest \
+  -c "SELECT status, count(*), count(sent_at) FROM posts GROUP BY status;"
+```
+
+اگر ردیفی با `status='sent'` و `sent_at` غیرخالی دیدید، کل زنجیره (RSS → LLM → Postgres →
+تلگرام) کار کرده است. اگر هیچ چیزی به تلگرام نرفت، طبیعی است: فقط پست‌های مرتبط، غیرتکراری و
+بالای `MIN_IMPORTANCE_TO_SEND` ارسال می‌شوند.
+
+## تنظیم‌های پرکاربرد
+
+هر تغییری این‌جا فقط یک ویرایش `.env` و یک `docker compose up -d` (برای بازسازی سرویس) می‌خواهد:
+
+| می‌خواهم … | متغیر |
+|---|---|
+| کمتر/بیشتر دنبال کنم | `POLL_INTERVAL_SECONDS` |
+| فقط پست‌های مهم‌تر بفرستم | `MIN_IMPORTANCE_TO_SEND=medium` یا `high` |
+| هزینه/طول پرامپت را کم کنم | `SIMILARITY_LOOKBACK_LIMIT` و `SIMILARITY_LOOKBACK_HOURS` |
+| لاگ دقیق‌تر ببینم | `LOG_LEVEL=DEBUG` |
+
+فهرست کامل و پیش‌فرض‌ها: بخش ۱۱ در [`AGENTS.md`](./AGENTS.md).
+
+## اضافه‌کردن ساب‌ردیت یا موضوع جدید
+
+همه‌چیز در `config/topics.yaml` است — **بدون تغییر کد**:
+
+```yaml
+topics:
+  - key: ai                                  # کلید موضوع؛ LLM فقط از بین همین کلیدها انتخاب می‌کند
+    name: "هوش مصنوعی"                       # نام فارسی که در پیام تلگرام دیده می‌شود
+    feeds:
+      - "https://www.reddit.com/r/mlops/new/.rss"
+
+  - key: security                            # موضوع جدید = یک بلوک جدید
+    name: "امنیت"
+    feeds:
+      - "https://www.reddit.com/r/netsec/new/.rss"
+      - "https://www.reddit.com/r/blueteamsec/new/.rss"
+```
+
+سه نکته:
+
+- الگوی فید ریدیت همیشه `https://www.reddit.com/r/<نام ساب‌ردیت>/new/.rss` است.
+- `key` همان مقداری است که به مدل به‌عنوان «موضوع مجاز» داده می‌شود و در دیتابیس ذخیره
+  می‌شود؛ `name` فقط برای نمایش فارسی است.
+- فهرست فعلی دو ساب‌ردیت **کم‌ترافیک** است (`r/mlops` ≈۳ پست در روز و `r/venturecapital` ≈۰.۴)
+  تا مصرف API رایگان و طول هر دور قابل پیش‌بینی بماند. افزودن ساب‌ردیت پرترافیک مجاز است ولی
+  هر پست جدید یک تماس LLM می‌خواهد: روی همان فیدهای زنده اندازه‌گیری شد که
+  `r/learnmachinelearning` حدوداً ۴۸ پست در روز و `r/deeplearning` حدوداً ۱۳ پست در روز دارد.
+
+پس از ویرایش، `docker compose up -d` کافی است (فایل داخل ایمیج کپی می‌شود، پس سرویس
+بازسازی می‌شود).
+
+## توقف و پاک‌کردن
+
+```bash
+docker compose stop worker     # توقف تمیز (SIGTERM) بدون از دست دادن چیزی
+docker compose down            # توقف همه سرویس‌ها؛ داده‌های Postgres در volume می‌مانند
+docker compose down -v         # + پاک‌کردن volume دیتابیس (همهٔ رکوردها می‌روند)
+```
+
+## اگر کار نکرد
+
+| نشانه در لاگ | معنا و راه‌حل |
+|---|---|
+| `failed permanently: ... HTTP 401` | توکن تلگرام یا کلید LLM غلط است (پشت‌سرهم تلاش نمی‌شود). |
+| `HTTP 400 ... chat not found` | `TELEGRAM_CHAT_ID` غلط است، یا ربات به چت/کانال اضافه نشده. |
+| `429` روی فید | ریدیت موقتاً به‌ازای IP محدود کرده؛ همان فید در آن دور رد می‌شود و دور بعد دوباره تلاش می‌شود. |
+| `Invalid LLM output` و ردیف‌های `failed` | مدل JSON معتبر برنگردانده؛ `llm_raw_response` همان ردیف دلیلش را نشان می‌دهد. |
+| هیچ پیامی نمی‌آید ولی خطایی هم نیست | پست‌ها یا نامرتبط/تکراری تشخیص داده شده‌اند یا زیر آستانهٔ اهمیت‌اند؛ ستون `status` را ببینید. |
+
+هیچ رازی در لاگ چاپ نمی‌شود (نه کلید مدل و نه توکن ربات) — اگر جایی چیزی دیدید، باگ است.
+
+## تست‌ها (برای توسعه)
 
 ```bash
 pip install -r requirements.txt
+
+pytest                          # واحد؛ هیچ تماس شبکه‌ای نمی‌زند
+docker compose up -d db         # و برای تست‌های دیتابیسی (روی Postgres واقعی):
 pytest
 ```
 
-تست‌ها هیچ تماس شبکه‌ای (RSS/LLM/Telegram) نمی‌زنند؛ به‌جای آن‌ها fake تزریق می‌شود. تست‌های `repository` عمداً integration هستند و روی یک Postgres واقعی اجرا می‌شوند:
+تست‌های دیتابیسی روی یک دیتابیس جداگانه (`<DATABASE_URL>_test`) اجرا می‌شوند که خودشان
+می‌سازند؛ بنابراین اجرای واقعی `worker` روی دیتابیس توسعه، نتیجهٔ تست‌ها را عوض نمی‌کند.
+اگر دیتابیسی بالا نباشد، این تست‌ها با یک پیام روشن skip می‌شوند.
 
-```bash
-docker compose up -d db   # دیتابیس محلی؛ اگر در دسترس نباشد این تست‌ها با پیام روشن skip می‌شوند
-pytest
-```
+## معماری و جزئیات بیشتر
 
-تست‌های دیتابیسی روی دیتابیس جداگانهٔ `<DATABASE_URL>_test` اجرا می‌شوند که خودشان می‌سازند؛ پس یک اجرای واقعی worker روی دیتابیس توسعه، آن‌ها را خراب نمی‌کند.
-
-## ساختار پروژه
-
-```
-app/
-  main.py               حلقه اجرای دوره‌ای
-  settings.py           تنظیمات env
-  models.py             مدل‌های Pydantic (اعتبارسنجی خروجی LLM)
-  reddit_source.py      مالک config/topics.yaml + واکشی/parse فید RSS
-  repository.py         تمام پرس‌وجوهای Postgres
-  llm_client.py         wrapper نازک روی SDK سازگار با OpenAI
-  prompts/              متن prompt، جدا از کد
-  analyzer.py           ساخت prompt + اعتبارسنجی خروجی LLM
-  formatting.py         تبدیل رکورد به پیام فارسی تلگرام
-  telegram_notifier.py  ارسال sendMessage
-  retry.py              retry/backoff مشترک
-  pipeline.py           هماهنگ‌سازی همه مراحل
-db/schema.sql           تنها منبع تغییر schema
-config/topics.yaml      موضوعات مجاز + فیدها
-tests/                  تست‌های واحد
-```
+- نقشهٔ ماژول‌ها، API هر ماژول و درخت تست‌ها: بخش ۹ در [`AGENTS.md`](./AGENTS.md)
+- الزامات عملکردی و Invariantهایی که نباید نقض شوند: بخش‌های ۵ و ۷
+- فرمت دقیق پیام تلگرام و قراردادهای کد: بخش‌های ۱۲ و ۱۳
