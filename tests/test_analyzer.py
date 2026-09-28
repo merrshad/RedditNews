@@ -13,7 +13,7 @@ from app.analyzer import (
     load_system_prompt,
     parse_analysis,
 )
-from app.models import RawPost, SimilarityCandidate
+from app.models import PostRecord, RawPost
 from tests.conftest import StubLlmClient
 
 ALLOWED_TOPICS = ["ai", "startup"]
@@ -40,10 +40,26 @@ def _post() -> RawPost:
     )
 
 
-def _candidates() -> list[SimilarityCandidate]:
+def _candidates() -> list[PostRecord]:
     return [
-        SimilarityCandidate(id=11, reddit_id="t3_prev1", title="Previous one", summary_fa="خلاصه ۱"),
-        SimilarityCandidate(id=12, reddit_id="t3_prev2", title="Previous two", summary_fa="خلاصه ۲"),
+        PostRecord(
+            id=11,
+            reddit_id="t3_prev1",
+            subreddit="MachineLearning",
+            source_topic_key="ai",
+            title="Previous one",
+            url="https://example.com/prev1",
+            summary_fa="خلاصه ۱",
+        ),
+        PostRecord(
+            id=12,
+            reddit_id="t3_prev2",
+            subreddit="MachineLearning",
+            source_topic_key="ai",
+            title="Previous two",
+            url="https://example.com/prev2",
+            summary_fa="خلاصه ۲",
+        ),
     ]
 
 

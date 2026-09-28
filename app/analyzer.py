@@ -17,7 +17,7 @@ from typing import Any, Sequence
 from pydantic import ValidationError
 
 from app.llm_client import LlmClient
-from app.models import LlmAnalysis, RawPost, SimilarityCandidate
+from app.models import LlmAnalysis, PostRecord, RawPost
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def load_system_prompt(path: str | Path = DEFAULT_PROMPT_PATH) -> str:
 
 def build_user_prompt(
     post: RawPost,
-    candidates: Sequence[SimilarityCandidate],
+    candidates: Sequence[PostRecord],
     allowed_topics: Sequence[str],
 ) -> str:
     """Build the single user message: new post + local-indexed candidates + topics.
@@ -148,7 +148,7 @@ def parse_analysis(
 
 def analyze_post(
     post: RawPost,
-    candidates: Sequence[SimilarityCandidate],
+    candidates: Sequence[PostRecord],
     *,
     llm_client: LlmClient,
     allowed_topics: Sequence[str],

@@ -1,4 +1,8 @@
-"""RSS fetching and parsing for the configured Reddit feeds (FR-1)."""
+"""RSS fetching and parsing for the configured Reddit feeds (FR-1).
+
+This module owns ``config/topics.yaml`` — the list of allowed topics and their feeds
+(NFR-7) — plus everything that turns a feed document into a :class:`RawPost`.
+"""
 
 from __future__ import annotations
 
@@ -7,19 +11,24 @@ import logging
 import re
 from datetime import datetime, timezone
 from html import unescape
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import feedparser
 import httpx
+import yaml
+from pydantic import BaseModel, Field, model_validator
 
 from app.models import RawPost
-from app.retry import call_with_retries
-from app.settings import TopicConfig
+from app.retry import retryable
 
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "reddit-telegram-digest/0.1 (+RSS reader)"
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TOPICS_PATH = PROJECT_ROOT / "config" / "topics.yaml"
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _INLINE_SPACE_RE = re.compile(r"[ \t]+")
@@ -29,6 +38,45 @@ _ID_IN_LINK_RE = re.compile(r"/comments/([a-z0-9]+)/", re.IGNORECASE)
 
 class FeedError(RuntimeError):
     """Raised when a feed cannot be fetched or parsed."""
+
+
+class TopicConfig(BaseModel):
+    """One allowed topic and the RSS feeds that feed it (NFR-7)."""
+
+    key: str
+    name: str
+    feeds: list[str] = Field(default_factory=list)
+
+
+class TopicsConfig(BaseModel):
+    """The whole ``config/topics.yaml`` document."""
+
+    topics: list[TopicConfig]
+
+    @model_validator(mode="after")
+    def _check_topics(self) -> "TopicsConfig":
+        keys = [topic.key for topic in self.topics]
+        if not keys:
+            raise ValueError("config/topics.yaml must define at least one topic")
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate topic keys in config/topics.yaml")
+        return self
+
+
+def load_topics_config(path: str | Path = DEFAULT_TOPICS_PATH) -> TopicsConfig:
+    """Read the allowed topics and their feeds (FR-1, FR-5, NFR-7).
+
+    The default points at ``config/topics.yaml`` inside the project root, so the
+    worker does not depend on its current working directory.
+    """
+    with Path(path).open(encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    return TopicsConfig.model_validate(raw)
+
+
+def topic_display_names(topics: Sequence[TopicConfig]) -> dict[str, str]:
+    """Map topic key -> Persian display name for Telegram messages (FR-10)."""
+    return {topic.key: topic.name for topic in topics}
 
 
 def strip_html(value: str) -> str:
@@ -137,38 +185,37 @@ def parse_feed(content: bytes | str, *, source_topic_key: str, feed_url: str = "
     return posts
 
 
-def fetch_feed(feed_url: str, *, max_retries: int) -> bytes:
-    """Download one feed with bounded retries/backoff (NFR-2)."""
+@retryable(description=lambda feed_url: f"fetch RSS feed {feed_url}")
+def fetch_feed(feed_url: str) -> bytes:
+    """Download one feed document with bounded retries and backoff (NFR-2).
 
-    def _get() -> bytes:
-        response = httpx.get(
-            feed_url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            follow_redirects=True,
-        )
-        response.raise_for_status()
-        return response.content
-
-    # Feed URLs are public configuration, never secrets, so they are safe to log.
-    return call_with_retries(
-        _get, attempts=max_retries, description=f"fetch RSS feed {feed_url}"
+    The attempt budget comes from ``HTTP_MAX_RETRIES`` (``app/retry.py``). Feed URLs
+    are public configuration, never secrets, so they are safe to log (Invariant 6).
+    """
+    response = httpx.get(
+        feed_url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        follow_redirects=True,
     )
+    response.raise_for_status()
+    return response.content
 
 
-def fetch_posts(topics: Sequence[TopicConfig], *, max_retries: int) -> list[RawPost]:
-    """Fetch and parse every feed of every topic, skipping the ones that fail.
+def fetch_all(topics_config: TopicsConfig) -> list[RawPost]:
+    """Fetch and parse every feed of every configured topic (FR-1).
 
-    Items are de-duplicated by ``reddit_id`` inside the batch (Invariant 1) while
-    keeping the first occurrence.
+    A feed that is still failing after its retries is logged and skipped, so one dead
+    feed can never stop the run (NFR-2 / Invariant 8). Items are de-duplicated by
+    ``reddit_id`` within the batch, keeping the first occurrence (Invariant 1).
     """
     posts: list[RawPost] = []
     seen: set[str] = set()
 
-    for topic in topics:
+    for topic in topics_config.topics:
         for feed_url in topic.feeds:
             try:
-                content = fetch_feed(feed_url, max_retries=max_retries)
+                content = fetch_feed(feed_url)
                 parsed_posts = parse_feed(
                     content, source_topic_key=topic.key, feed_url=feed_url
                 )

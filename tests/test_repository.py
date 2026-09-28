@@ -1,171 +1,277 @@
-"""FR-2 / FR-9 / FR-11 tests: SQL shape and row mapping, no real database."""
+"""FR-2 / FR-4 / FR-9 / FR-11 against a real Postgres (`docker compose up -d db`).
+
+Deliberately integration tests rather than cursor mocks: the parametrized SQL, the
+JSONB round-trip, the UNIQUE(reddit_id) idempotency and the ``to_send`` filtering are
+exactly what this phase must prove, and none of them can be proven by a fake cursor.
+They skip themselves with a clear message when no Postgres is reachable.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from psycopg.types.json import Jsonb
+import psycopg
+import pytest
 
-from app.models import AnalyzedPost, RawPost
-from app.repository import PostRepository
-from tests.conftest import FakeConnection
-
-
-def _repository(responses: list[list[dict]] | None = None) -> tuple[PostRepository, FakeConnection]:
-    connection = FakeConnection(responses)
-    return PostRepository(connection), connection
+from app import repository
+from app.models import PostRecord
+from tests.conftest import TEST_REDDIT_ID_PREFIX
 
 
-def test_exists_returns_true_when_a_row_is_found() -> None:
-    repository, connection = _repository([[{"?column?": 1}]])
-
-    assert repository.exists("t3_1abcde") is True
-    sql, params = connection.executed[0]
-    assert "FROM posts WHERE reddit_id = %s" in sql
-    assert params == ("t3_1abcde",)
-
-
-def test_exists_returns_false_when_no_row_is_found() -> None:
-    repository, _ = _repository([[]])
-
-    assert repository.exists("t3_missing") is False
-
-
-def test_get_similarity_candidates_maps_rows_and_passes_limits() -> None:
-    rows = [
-        {"id": 7, "reddit_id": "t3_new", "title": "Newest", "summary_fa": "خلاصه"},
-        {"id": 3, "reddit_id": "t3_old", "title": "Older", "summary_fa": None},
-    ]
-    repository, connection = _repository([rows])
-
-    candidates = repository.get_similarity_candidates(limit=50, hours=72)
-
-    assert [candidate.id for candidate in candidates] == [7, 3]
-    assert candidates[0].summary_fa == "خلاصه"
-    _, params = connection.executed[0]
-    assert params == (72, 50)
+def _record(reddit_id: str, **overrides: Any) -> PostRecord:
+    """A fully analysed post; ``overrides`` tweak one field per test."""
+    fields: dict[str, Any] = {
+        "reddit_id": reddit_id,
+        "subreddit": "MachineLearning",
+        "source_topic_key": "ai",
+        "title": "A new open model was released",
+        "url": f"https://www.reddit.com/r/MachineLearning/comments/{reddit_id}/x/",
+        "author": "somebody",
+        "raw_content": "Body text",
+        "published_at": datetime.now(timezone.utc),
+        "is_relevant": True,
+        "duplicate_of_id": None,
+        "topic": "ai",
+        "importance": "high",
+        "summary_fa": "خلاصه فارسی پست.",
+        "key_points": ["نکته اول", "نکته دوم"],
+        "llm_raw_response": {"is_relevant": True},
+        "status": "to_send",
+    }
+    fields.update(overrides)
+    return PostRecord(**fields)
 
 
-def test_insert_post_sends_jsonb_payload_and_returns_the_new_id() -> None:
-    repository, connection = _repository([[{"id": 42}]])
-    record = AnalyzedPost(
-        reddit_id="t3_1abcde",
-        subreddit="MachineLearning",
-        source_topic_key="ai",
-        title="Title",
-        url="https://example.com/post",
-        author="somebody",
-        raw_content="body",
-        published_at=datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc),
-        is_relevant=True,
-        duplicate_of_id=None,
-        topic="ai",
-        importance="high",
-        summary_fa="خلاصه فارسی",
-        key_points=["نکته یک"],
-        llm_raw_response={"is_relevant": True},
-        status="to_send",
-    )
-
-    assert repository.insert_post(record) == 42
-
-    sql, params = connection.executed[0]
-    assert "INSERT INTO posts" in sql
-    assert "ON CONFLICT (reddit_id) DO NOTHING" in sql
-    assert params[0] == "t3_1abcde"
-    assert params[6] == "body"
-    assert params[9] is None  # duplicate_of_id
-    assert params[11] == "high"  # importance
-    assert isinstance(params[13], Jsonb) and params[13].obj == ["نکته یک"]
-    assert isinstance(params[14], Jsonb)
-    assert params[15] == "to_send"
+def _row(connection: psycopg.Connection, post_id: int) -> dict[str, Any]:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
+        row = cursor.fetchone()
+    assert row is not None
+    return row
 
 
-def test_insert_post_returns_none_for_an_already_stored_reddit_id() -> None:
-    repository, _ = _repository([[]])
-    record = AnalyzedPost(
-        reddit_id="t3_dupe",
-        subreddit="startups",
-        source_topic_key="startup",
-        title="Title",
-        url="https://example.com/post",
-        status="to_send",
-    )
-
-    assert repository.insert_post(record) is None
+def _count(connection: psycopg.Connection, reddit_id: str) -> int:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) AS total FROM posts WHERE reddit_id = %s", (reddit_id,))
+        return int(cursor.fetchone()["total"])
 
 
-def test_insert_post_sends_null_raw_response_when_absent() -> None:
-    repository, connection = _repository([[{"id": 1}]])
+# --- exists (FR-2) ---------------------------------------------------------------
 
-    repository.insert_post(
-        AnalyzedPost(
-            reddit_id="t3_x",
-            subreddit="r",
-            source_topic_key="ai",
-            title="t",
-            url="u",
+
+def test_exists_is_false_before_save_and_true_after(db_connection: psycopg.Connection) -> None:
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}exists"
+
+    assert repository.exists(reddit_id) is False
+
+    post_id = repository.save(_record(reddit_id))
+
+    assert post_id > 0
+    assert repository.exists(reddit_id) is True
+
+
+def test_exists_treats_its_argument_as_data_not_sql(db_connection: psycopg.Connection) -> None:
+    """Every query is parametrized (AGENTS.md section 12)."""
+    assert repository.exists("t3_x'; DROP TABLE posts; --") is False
+    assert repository.exists("t3_1abcde") is False
+
+
+# --- save (FR-9) -----------------------------------------------------------------
+
+
+def test_save_persists_every_field(db_connection: psycopg.Connection) -> None:
+    record = _record(f"{TEST_REDDIT_ID_PREFIX}fields")
+
+    post_id = repository.save(record)
+
+    row = _row(db_connection, post_id)
+    assert row["reddit_id"] == record.reddit_id
+    assert row["subreddit"] == "MachineLearning"
+    assert row["source_topic_key"] == "ai"
+    assert row["title"] == record.title
+    assert row["url"] == record.url
+    assert row["author"] == "somebody"
+    assert row["raw_content"] == "Body text"
+    assert row["published_at"] == record.published_at
+    assert row["is_relevant"] is True
+    assert row["duplicate_of_id"] is None
+    assert row["topic"] == "ai"
+    assert row["importance"] == "high"
+    assert row["summary_fa"] == "خلاصه فارسی پست."
+    assert row["key_points"] == ["نکته اول", "نکته دوم"]
+    assert row["llm_raw_response"] == {"is_relevant": True}
+    assert row["status"] == "to_send"
+    assert row["sent_at"] is None
+
+
+def test_save_stores_an_unanalysed_post_as_failed(db_connection: psycopg.Connection) -> None:
+    """Invariant 3 — a rejected LLM answer is still recorded, with empty analysis."""
+    post_id = repository.save(
+        _record(
+            f"{TEST_REDDIT_ID_PREFIX}failed",
             status="failed",
+            is_relevant=None,
+            topic=None,
+            importance=None,
+            summary_fa=None,
+            key_points=[],
+            llm_raw_response=None,
         )
     )
 
-    _, params = connection.executed[0]
-    assert params[14] is None
-    assert params[13].obj == []
+    row = _row(db_connection, post_id)
+    assert row["status"] == "failed"
+    assert row["is_relevant"] is None
+    assert row["key_points"] == []
+    assert row["llm_raw_response"] is None
 
 
-def test_mark_sent_updates_status_and_sent_at() -> None:
-    repository, connection = _repository()
+def test_save_is_idempotent_for_the_same_reddit_id(db_connection: psycopg.Connection) -> None:
+    """NFR-1 / Invariant 1 — a repeated run never writes a second row."""
+    reddit_id = f"{TEST_REDDIT_ID_PREFIX}dupe"
 
-    repository.mark_sent(42)
+    first = repository.save(_record(reddit_id, summary_fa="خلاصه اول"))
+    second = repository.save(_record(reddit_id, summary_fa="خلاصه دوم"))
 
-    sql, params = connection.executed[0]
-    assert "SET status = 'sent', sent_at = now()" in sql
-    assert params == (42,)
-
-
-def test_fetch_pending_send_returns_post_records() -> None:
-    rows = [
-        {
-            "id": 5,
-            "reddit_id": "t3_pending",
-            "subreddit": "MachineLearning",
-            "source_topic_key": "ai",
-            "title": "Pending",
-            "url": "https://example.com/pending",
-            "author": "somebody",
-            "topic": "ai",
-            "importance": "medium",
-            "summary_fa": "خلاصه",
-            "key_points": ["نکته"],
-            "published_at": None,
-            "status": "to_send",
-        }
-    ]
-    repository, connection = _repository([rows])
-
-    pending = repository.fetch_pending_send()
-
-    assert len(pending) == 1
-    assert pending[0].id == 5
-    assert pending[0].key_points == ["نکته"]
-    assert pending[0].status == "to_send"
-    sql = connection.statements[0]
-    assert "WHERE status = 'to_send'" in sql
-    assert "ORDER BY id" in sql
+    assert first == second
+    assert _count(db_connection, reddit_id) == 1
+    # The conflicting save must not overwrite what is already stored.
+    assert _row(db_connection, first)["summary_fa"] == "خلاصه اول"
 
 
-def test_analyzed_post_accepts_a_raw_post_without_analysis() -> None:
-    """The `failed` path stores the raw post with empty analysis fields (Invariant 3)."""
-    raw = RawPost(
-        reddit_id="t3_x",
-        subreddit="startups",
-        source_topic_key="startup",
-        title="Title",
-        url="https://example.com/x",
+def test_save_keeps_duplicate_of_id_pointing_at_another_row(db_connection: psycopg.Connection) -> None:
+    original_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}original"))
+
+    duplicate_id = repository.save(
+        _record(
+            f"{TEST_REDDIT_ID_PREFIX}duplicate",
+            duplicate_of_id=original_id,
+            status="skipped_duplicate",
+        )
     )
 
-    record = AnalyzedPost(**raw.model_dump(), status="failed")
+    assert _row(db_connection, duplicate_id)["duplicate_of_id"] == original_id
 
-    assert record.is_relevant is None
-    assert record.key_points == []
+
+# --- fetch_recent_candidates (FR-4 / Invariant 10) --------------------------------
+
+
+def test_fetch_recent_candidates_returns_at_most_limit_newest_first(
+    db_connection: psycopg.Connection,
+) -> None:
+    now = datetime.now(timezone.utc)
+    for index in range(3):
+        repository.save(
+            _record(
+                f"{TEST_REDDIT_ID_PREFIX}recent{index}",
+                published_at=now - timedelta(hours=index),
+            )
+        )
+
+    candidates = repository.fetch_recent_candidates(limit=2, hours=72)
+
+    assert [candidate.reddit_id for candidate in candidates] == [
+        f"{TEST_REDDIT_ID_PREFIX}recent0",
+        f"{TEST_REDDIT_ID_PREFIX}recent1",
+    ]
+    assert isinstance(candidates[0].id, int)
+    assert candidates[0].importance == "high"
+    assert candidates[0].key_points == ["نکته اول", "نکته دوم"]
+
+
+def test_fetch_recent_candidates_excludes_unanalysed_and_old_posts(
+    db_connection: psycopg.Connection,
+) -> None:
+    now = datetime.now(timezone.utc)
+    repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}keep", published_at=now - timedelta(hours=1)))
+    repository.save(
+        _record(
+            f"{TEST_REDDIT_ID_PREFIX}no_summary",
+            summary_fa=None,
+            status="failed",
+            published_at=now,
+        )
+    )
+    repository.save(
+        _record(f"{TEST_REDDIT_ID_PREFIX}old", published_at=now - timedelta(hours=100))
+    )
+
+    candidates = repository.fetch_recent_candidates(limit=50, hours=72)
+
+    assert [candidate.reddit_id for candidate in candidates] == [f"{TEST_REDDIT_ID_PREFIX}keep"]
+
+
+def test_fetch_recent_candidates_honours_the_limit_without_rows_to_spare(
+    db_connection: psycopg.Connection,
+) -> None:
+    repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}only"))
+
+    assert len(repository.fetch_recent_candidates(limit=5, hours=72)) == 1
+
+
+# --- fetch_pending_to_send (FR-11) ------------------------------------------------
+
+
+def test_fetch_pending_to_send_returns_only_to_send_rows(db_connection: psycopg.Connection) -> None:
+    pending_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}pending"))
+    repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}sent", status="sent"))
+    repository.save(
+        _record(
+            f"{TEST_REDDIT_ID_PREFIX}irrelevant",
+            status="skipped_irrelevant",
+            is_relevant=False,
+            summary_fa=None,
+        )
+    )
+
+    records = repository.fetch_pending_to_send()
+
+    assert [record.id for record in records] == [pending_id]
+    assert records[0].status == "to_send"
+    assert records[0].summary_fa == "خلاصه فارسی پست."
+    assert records[0].key_points == ["نکته اول", "نکته دوم"]
+
+
+def test_fetch_pending_to_send_returns_oldest_first(db_connection: psycopg.Connection) -> None:
+    first = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}pending_a"))
+    second = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}pending_b"))
+
+    assert [record.id for record in repository.fetch_pending_to_send()] == [first, second]
+
+
+# --- update_status (FR-10 / FR-11) ------------------------------------------------
+
+
+def test_update_status_marks_sent_with_the_given_timestamp(db_connection: psycopg.Connection) -> None:
+    post_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}status_update"))
+    sent_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    repository.update_status(post_id, "sent", sent_at)
+
+    row = _row(db_connection, post_id)
+    assert row["status"] == "sent"
+    assert row["sent_at"] == sent_at
+    assert repository.fetch_pending_to_send() == []
+
+
+def test_update_status_keeps_the_previous_timestamp_when_none_is_passed(
+    db_connection: psycopg.Connection,
+) -> None:
+    post_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}keep_sent_at"))
+    sent_at = datetime.now(timezone.utc).replace(microsecond=0)
+    repository.update_status(post_id, "sent", sent_at)
+
+    repository.update_status(post_id, "failed")
+
+    row = _row(db_connection, post_id)
+    assert row["status"] == "failed"
+    assert row["sent_at"] == sent_at
+
+
+def test_update_status_rejects_a_status_outside_the_schema(db_connection: psycopg.Connection) -> None:
+    """The CHECK constraint in db/schema.sql is the last line of defence (section 10)."""
+    post_id = repository.save(_record(f"{TEST_REDDIT_ID_PREFIX}bad_status"))
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        repository.update_status(post_id, "teleported")

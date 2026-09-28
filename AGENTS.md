@@ -227,19 +227,19 @@ reddit-telegram-digest/
 │   ├── __init__.py
 │   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای پایپ‌لاین
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
-│   ├── models.py              # مدل‌های Pydantic: RawPost, SimilarityCandidate, LlmAnalysis, AnalyzedPost, PostRecord
-│   ├── reddit_source.py       # واکشی/parse RSS  → FR-1
-│   ├── repository.py          # تمام پرس‌وجوهای DB → FR-2, FR-9, FR-11
+│   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
+│   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
+│   ├── repository.py          # تمام پرس‌وجوهای DB؛ API: exists, save, update_status, fetch_recent_candidates, fetch_pending_to_send → FR-2, FR-4, FR-9, FR-11
 │   ├── llm_client.py          # wrapper نازک روی SDK OpenAI-compatible + retry
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
 │   ├── analyzer.py            # ساخت prompt، فراخوانی llm_client، اعتبارسنجی خروجی → FR-3..FR-8
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده → FR-10
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
-│   ├── retry.py               # یوتیلیتی retry/backoff مشترک (DRY، NFR-2)
+│   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
 │   └── pipeline.py            # orchestration: اتصال همه ماژول‌های بالا به هم
 └── tests/
-    ├── conftest.py             # fixtureهای مشترک (کانکشن/LLM جعلی؛ بدون شبکه واقعی)
+    ├── conftest.py             # fixtureهای مشترک (جایگزین in-memory برای repository، LLM جعلی، کانکشن واقعی برای تست‌های DB)
     ├── test_reddit_source.py
     ├── test_repository.py
     ├── test_analyzer.py
@@ -248,6 +248,8 @@ reddit-telegram-digest/
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
+
+`repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
 
 ---
 
@@ -364,7 +366,7 @@ topics:
 - **DRY**: منطق تکراری (مثلاً retry، اعتبارسنجی، فرمت تاریخ) فقط یک‌بار در یک ماژول مشترک (`retry.py`, `models.py`) نوشته می‌شود.
 - **YAGNI**: هیچ قابلیتی «برای آینده» اضافه نشود مگر در بخش ۲ (در دامنه) ذکر شده باشد. اگر Agent فکر می‌کند چیزی لازم است ولی در این سند نیست، باید طبق قانون بخش ۱۴ عمل کند (اول مستند، بعد کد؛ یا سوال از کاربر).
 - **جداسازی مسئولیت‌ها**: هیچ ماژولی نباید هم‌زمان I/O خارجی و منطق تصمیم‌گیری را قاطی کند. مثلاً `analyzer.py` منطق ساخت prompt و تفسیر خروجی را دارد، اما تماس HTTP خام در `llm_client.py` است.
-- **خطا و Retry**: تمام تماس‌های خارجی از `retry.py` (تلاش محدود با backoff نمایی، پارامتر از `HTTP_MAX_RETRIES`) عبور می‌کنند. خطای یک پست فقط همان پست را `failed` می‌کند و اجرای بقیه ادامه دارد.
+- **خطا و Retry**: تمام تماس‌های خارجی (RSS، LLM، Telegram) با دکوریتور `retryable` از `retry.py` پوشش داده می‌شوند (تلاش محدود با backoff نمایی، سقف از `HTTP_MAX_RETRIES`). خطای یک پست فقط همان پست را `failed` می‌کند و اجرای بقیه ادامه دارد.
 - **اعتبارسنجی خروجی LLM**: همیشه با مدل Pydantic در `app/models.py`؛ هرگز دسترسی مستقیم به دیکشنری JSON خام در جاهای دیگر کد.
 - **پیام تلگرام**: با `parse_mode=HTML` (نه MarkdownV2) برای escaping ساده‌تر؛ فقط `<`, `>`, `&` نیاز به escape دارند.
 - **لاگ**: هرگز مقدار خام کلید/توکن در لاگ چاپ نشود؛ لاگ‌ها ساخت‌یافته و شامل `reddit_id` برای ردیابی باشند.
@@ -448,6 +450,7 @@ pytest
 ## ۱۶. تاریخچه تصمیمات (Changelog)
 
 - **۲۰۲۶-۰۹-۲۸** — ایجاد اولیه سند. تصمیمات گرفته‌شده با کاربر: (۱) LLM از طریق API رایگان OpenAI-compatible، (۲) تشخیص شباهت به همان LLM سپرده شد (نه embedding)، (۳) ارسال تلگرام تک‌کاناله/broadcast بدون مدیریت مشترک. تصمیمات تکمیلی توسط Agent مطابق بخش ۳ مستند شد.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۲ — مسیر دریافت داده)** — بازآرایی `reddit_source` و `repository` طبق تصمیم صریح کاربر: (۱) `repository.py` به توابع ماژول‌سطح `exists`/`save`/`update_status`/`fetch_recent_candidates`/`fetch_pending_to_send` تبدیل شد و هر فراخوانی کانکشن کوتاه‌عمر خودش را باز/بسته می‌کند (بدون pool) — چون pipeline تک‌رشته‌ای است و کانکشن بلندعمر فقط حالت اضافی می‌ساخت؛ (۲) `save` روی `reddit_id` تکراری هیچ‌چیز نمی‌نویسد و `id` موجود را برمی‌گرداند، تا NFR-1/Invariant 1 بدون شرط اضافه در کد و analyzer/pipeline تضمین شود؛ (۳) retry با دکوریتور `retryable` روی هر تماس خارجی اعمال می‌شود و سقف تلاش در زمان فراخوانی از `HTTP_MAX_RETRIES` خوانده می‌شود (NFR-2/Invariant 8، NFR-7)؛ (۴) مالکیت `config/topics.yaml` از `settings.py` به `reddit_source.py` منتقل شد (`TopicConfig`/`TopicsConfig`/`load_topics_config`/`fetch_all`) تا گرفتن داده و پیکربندی فیدها یک‌جا باشند؛ (۵) مدل‌ها به سه مدل `RawPost`/`LlmAnalysis`/`PostRecord` تجمیع شدند و `SimilarityCandidate`/`AnalyzedPost` (که فقط رونوشت فیلدهای `PostRecord` بودند) حذف شدند — `PostRecord.id` تا قبل از `save` مقدار `None` دارد. هیچ Invariantای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
 - **۲۰۲۶-۰۹-۲۸** — پیاده‌سازی MVP طبق همین سند. سه تصمیم که در جریان پیاده‌سازی گرفته شد و سند با آن‌ها هم‌راستا شد:
   1. **افزودن status جدید `skipped_low_importance`** (بخش ۱۰): سند قبلاً برای حالت «مرتبط و غیرتکراری اما زیر آستانه `MIN_IMPORTANCE_TO_SEND`» هیچ status‌ای نداشت و مجبور می‌شدیم آن را `skipped_irrelevant` بنامیم که داده را گمراه‌کننده می‌کرد. دلیل: FR-10 شرط (ج) با آستانه‌های `medium`/`high` هم باید قابل ردیابی باشد.
   2. **شفاف‌سازی معنای `HTTP_MAX_RETRIES`** (بخش ۱۱): به‌جای «تعداد تلاش مجدد»، «حداکثر تعداد تلاش کل (شامل تلاش اول)» تعریف شد تا مرز تلاش‌ها قطعی و قابل تست باشد (Invariant 8).

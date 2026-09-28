@@ -39,16 +39,21 @@ pip install -r requirements.txt
 pytest
 ```
 
-تست‌های واحد هیچ تماس شبکه یا دیتابیس واقعی ندارند (RSS/LLM/Telegram/DB با fake جایگزین می‌شوند).
+تست‌ها هیچ تماس شبکه‌ای (RSS/LLM/Telegram) نمی‌زنند؛ به‌جای آن‌ها fake تزریق می‌شود. تست‌های `repository` عمداً integration هستند و روی یک Postgres واقعی اجرا می‌شوند:
+
+```bash
+docker compose up -d db   # دیتابیس محلی؛ اگر در دسترس نباشد این تست‌ها با پیام روشن skip می‌شوند
+pytest
+```
 
 ## ساختار پروژه
 
 ```
 app/
   main.py               حلقه اجرای دوره‌ای
-  settings.py           تنظیمات env + خواندن config/topics.yaml
+  settings.py           تنظیمات env
   models.py             مدل‌های Pydantic (اعتبارسنجی خروجی LLM)
-  reddit_source.py      واکشی/parse فید RSS
+  reddit_source.py      مالک config/topics.yaml + واکشی/parse فید RSS
   repository.py         تمام پرس‌وجوهای Postgres
   llm_client.py         wrapper نازک روی SDK سازگار با OpenAI
   prompts/              متن prompt، جدا از کد
