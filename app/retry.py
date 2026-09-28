@@ -4,7 +4,9 @@ Two entry points, one implementation:
 
 - :func:`retryable` — the decorator every external call site uses (RSS, LLM, Telegram),
 - :func:`call_with_retries` — the engine underneath, for calls that are not a plain
-  function (a bound SDK method, a closure).
+  function (a bound SDK method, a closure),
+- :class:`PermanentError` — the marker a call site raises to opt out of retrying at all
+  (a rejected token or API key never becomes valid on the second attempt).
 """
 
 from __future__ import annotations
@@ -22,6 +24,18 @@ T = TypeVar("T")
 
 BASE_DELAY_SECONDS = 1.0
 BACKOFF_FACTOR = 2.0
+
+
+class PermanentError(RuntimeError):
+    """A failure retrying cannot fix, so the attempt budget must not be spent on it.
+
+    A call site raises this when the remote end already said the *request* is wrong
+    rather than the attempt unlucky — a rejected bot token, an unknown chat, a 404 feed,
+    an invalid API key. Every attempt would fail identically, so
+    :func:`call_with_retries` re-raises it at once instead of sleeping through the
+    remaining attempts. Measured in a real run (phase 4): an invalid key cost ~6s per
+    post, ~3 minutes per 25-post cycle, forever.
+    """
 
 # Either a literal label or a callable that derives one from the wrapped call's own
 # arguments (e.g. the feed URL). It must never return secrets (Invariant 6).
@@ -41,7 +55,7 @@ def call_with_retries(
     attempts: int,
     description: str,
     base_delay: float = BASE_DELAY_SECONDS,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] | None = None,
 ) -> T:
     """Run ``operation`` until it succeeds or the attempt budget is exhausted.
 
@@ -49,15 +63,24 @@ def call_with_retries(
     ``HTTP_MAX_RETRIES=3`` means at most 3 calls. The delay between attempts grows
     exponentially (``base_delay * 2 ** (attempt - 1)``).
 
+    ``sleep`` defaults to ``time.sleep``, resolved here rather than as a default
+    argument, so a test can replace ``time.sleep`` for either this function or the
+    decorator and never really wait.
+
     The final failure is re-raised unchanged so callers can decide what to do with
     the post/feed (Invariant 8). ``description`` must never contain secrets.
     """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
+    sleep = time.sleep if sleep is None else sleep
 
     for attempt in range(1, attempts + 1):
         try:
             return operation()
+        except PermanentError as exc:
+            # Retrying cannot change the answer; fail now and leave the backoff unused.
+            logger.error("%s failed permanently: %s", description, exc)
+            raise
         except Exception as exc:
             if attempt >= attempts:
                 logger.error(

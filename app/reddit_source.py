@@ -9,6 +9,7 @@ from __future__ import annotations
 import calendar
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -20,12 +21,20 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from app.models import RawPost
-from app.retry import retryable
+from app.retry import PermanentError, retryable
 
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "reddit-telegram-digest/0.1 (+RSS reader)"
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+# Reddit answers 429 (not 403) when it rate-limits the `.rss` endpoints, and sends a
+# `Retry-After` header with it. Honouring that header is the difference between backing
+# off and hammering: a real phase-4 run got 429 after a handful of quick requests and the
+# plain 1s/2s backoff was not enough. The wait is capped so one slow feed can never stall
+# a whole cycle for minutes (NFR-2).
+RATE_LIMIT_STATUS = 429
+MAX_RETRY_AFTER_SECONDS = 30.0
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TOPICS_PATH = PROJECT_ROOT / "config" / "topics.yaml"
@@ -185,12 +194,28 @@ def parse_feed(content: bytes | str, *, source_topic_key: str, feed_url: str = "
     return posts
 
 
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """How long the server asked us to wait, capped at ``MAX_RETRY_AFTER_SECONDS``.
+
+    Absent or unparsable header means ``0.0``: the normal exponential backoff applies.
+    """
+    try:
+        seconds = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        return 0.0
+    return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
+
+
 @retryable(description=lambda feed_url: f"fetch RSS feed {feed_url}")
 def fetch_feed(feed_url: str) -> bytes:
     """Download one feed document with bounded retries and backoff (NFR-2).
 
     The attempt budget comes from ``HTTP_MAX_RETRIES`` (``app/retry.py``). Feed URLs
     are public configuration, never secrets, so they are safe to log (Invariant 6).
+
+    Only the rate-limit status is worth another attempt: any other 4xx (moved, blocked,
+    gone) would fail identically forever, so it raises :class:`PermanentError` and the
+    run moves on to the next feed at once (Invariant 8).
     """
     response = httpx.get(
         feed_url,
@@ -198,6 +223,21 @@ def fetch_feed(feed_url: str) -> bytes:
         timeout=REQUEST_TIMEOUT_SECONDS,
         follow_redirects=True,
     )
+
+    status = response.status_code
+    if status == RATE_LIMIT_STATUS:
+        delay = _retry_after_seconds(response)
+        if delay:
+            logger.warning(
+                "Feed %s is rate-limited; waiting %.0fs before retrying", feed_url, delay
+            )
+            time.sleep(delay)
+    elif 400 <= status < 500:
+        # 429 is handled above, so anything left here is the request's own fault (404 feed
+        # deleted, 403 blocked, 400 malformed) and would fail identically forever.
+        raise PermanentError(f"feed {feed_url} answered HTTP {status}")
+
+    # 429 and every 5xx keep their place in the retry budget; the caller backs off.
     response.raise_for_status()
     return response.content
 

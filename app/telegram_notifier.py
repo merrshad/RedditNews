@@ -17,13 +17,17 @@ import logging
 
 import httpx
 
-from app.retry import retryable
+from app.retry import PermanentError, retryable
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+# Telegram answers 429 when it throttles us (worth waiting for) and 400/401/403 when the
+# request itself is wrong (bad token, unknown chat, malformed HTML — never worth it).
+RATE_LIMIT_STATUS = 429
 
 # Telegram's hard limit for a single message. Truncating is formatting.py's job
 # (FR-10), so this module only reports the anomaly (see :func:`send_message`).
@@ -32,6 +36,17 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 
 class TelegramError(RuntimeError):
     """Telegram rejected the message or could not be reached (never carries the token)."""
+
+
+class TelegramPermanentError(TelegramError, PermanentError):
+    """Telegram said the request itself is wrong, so no attempt can succeed (Phase 4).
+
+    Still a :class:`TelegramError`, which keeps :func:`send_message`'s contract intact:
+    the failure becomes ``False`` and the post stays ``to_send`` (FR-11) — it just stops
+    burning the retry budget and its backoff sleeps first. A real run with a rejected
+    token wasted ~3.3s per post (≈80s per 25-post cycle) retrying an answer that could
+    never change.
+    """
 
 
 def _describe_call(text: str) -> str:
@@ -71,9 +86,12 @@ def _send_message_once(text: str) -> None:
         description = "unknown"
         if isinstance(body, dict):
             description = str(body.get("description") or description)
-        raise TelegramError(
+        message = (
             f"sendMessage rejected (HTTP {response.status_code}, description: {description})"
         )
+        if 400 <= response.status_code < 500 and response.status_code != RATE_LIMIT_STATUS:
+            raise TelegramPermanentError(message)
+        raise TelegramError(message)
 
 
 def send_message(text: str) -> bool:
@@ -94,7 +112,7 @@ def send_message(text: str) -> bool:
 
     try:
         _send_message_once(text)
-    except TelegramError as exc:
+    except TelegramError as exc:  # includes TelegramPermanentError: same answer, no retries
         logger.error("Telegram send failed, keeping the post for the next run: %s", exc)
         return False
 

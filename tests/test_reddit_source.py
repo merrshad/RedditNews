@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
+from itertools import chain
 from typing import Any
 
 import httpx
@@ -12,6 +13,7 @@ import pytest
 
 from app.reddit_source import (
     DEFAULT_TOPICS_PATH,
+    MAX_RETRY_AFTER_SECONDS,
     FeedError,
     TopicConfig,
     TopicsConfig,
@@ -23,6 +25,7 @@ from app.reddit_source import (
     strip_html,
     subreddit_from_feed_url,
 )
+from app.retry import PermanentError
 
 FEED_URL = "https://www.reddit.com/r/MachineLearning/new/.rss"
 
@@ -240,16 +243,33 @@ def test_subreddit_from_feed_url(url: str, expected: str | None) -> None:
 # --- fetch_feed (retry + User-Agent, NFR-2/Invariant 8) ---------------------------
 
 
+class _FakeResponse:
+    """Minimal ``httpx.Response`` stand-in: only what the status handling reads."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        *,
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("GET", FEED_URL),
+                response=None,  # type: ignore[arg-type]
+            )
+
+
 def _explode_first(
     calls: list[str], *, failures: int = 1, payload: bytes = b""
 ) -> Callable[..., Any]:
     """An ``httpx.get`` stand-in that raises for the first ``failures`` calls."""
-
-    class FakeResponse:
-        content = payload
-
-        def raise_for_status(self) -> None:
-            return None
 
     def fake_get(
         url: str, *, headers: dict[str, str], timeout: float, follow_redirects: bool
@@ -257,7 +277,7 @@ def _explode_first(
         calls.append(headers["User-Agent"])
         if len(calls) <= failures:
             raise httpx.ConnectError("connection reset by peer")
-        return FakeResponse()
+        return _FakeResponse(content=payload)
 
     return fake_get
 
@@ -288,6 +308,64 @@ def test_fetch_feed_gives_up_after_the_configured_attempts(
         fetch_feed(FEED_URL)
 
     assert len(calls) == 3
+
+
+def test_fetch_feed_waits_as_long_as_the_rate_limit_asks(
+    monkeypatch: pytest.MonkeyPatch, sample_feed: bytes
+) -> None:
+    """A real phase-4 run got HTTP 429 from Reddit: `Retry-After` must be honoured.
+
+    The plain 1s/2s backoff re-hit the rate-limited endpoint almost immediately, which is
+    what kept it rate-limited.
+    """
+    slept: list[float] = []
+    responses = chain(
+        [_FakeResponse(429, headers={"Retry-After": "7"})],
+        [_FakeResponse(content=sample_feed)],
+    )
+    monkeypatch.setattr("app.reddit_source.httpx.get", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(time, "sleep", slept.append)
+    monkeypatch.setenv("HTTP_MAX_RETRIES", "3")
+
+    assert fetch_feed(FEED_URL) == sample_feed
+
+    assert slept[0] == 7  # what the server asked for, before the engine's own backoff
+    assert len(slept) == 2  # the rate-limit wait plus one retry backoff
+
+
+def test_fetch_feed_caps_the_rate_limit_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One impatient server must not be able to stall a whole cycle (NFR-2)."""
+    slept: list[float] = []
+    monkeypatch.setattr(
+        "app.reddit_source.httpx.get", lambda *args, **kwargs: _FakeResponse(429, headers={"Retry-After": "9999"})
+    )
+    monkeypatch.setattr(time, "sleep", slept.append)
+    monkeypatch.setenv("HTTP_MAX_RETRIES", "1")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        fetch_feed(FEED_URL)
+
+    assert slept == [MAX_RETRY_AFTER_SECONDS]
+
+
+def test_fetch_feed_stops_at_once_for_a_permanent_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted or forbidden feed answers the same forever, so attempts are not wasted."""
+    calls: list[int] = []
+
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeResponse:
+        calls.append(1)
+        return _FakeResponse(404)
+
+    monkeypatch.setattr("app.reddit_source.httpx.get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setenv("HTTP_MAX_RETRIES", "3")
+
+    with pytest.raises(PermanentError):
+        fetch_feed(FEED_URL)
+
+    assert len(calls) == 1
 
 
 # --- fetch_all (FR-1) -------------------------------------------------------------
