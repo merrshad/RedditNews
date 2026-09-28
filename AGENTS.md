@@ -225,7 +225,7 @@ reddit-telegram-digest/
 │   └── schema.sql            # تنها منبع تغییر schema (بخش ۱۰)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای پایپ‌لاین
+│   ├── main.py                # نقطه ورود: حلقه `pipeline.run_once()` + خروج تمیز روی SIGTERM (NFR-2/NFR-3)
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
 │   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
 │   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
@@ -237,7 +237,7 @@ reddit-telegram-digest/
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
-│   └── pipeline.py            # orchestration: اتصال همه ماژول‌های بالا به هم
+│   └── pipeline.py            # orchestration؛ API: run_once, retry_pending_sends → FR-1..FR-11
 └── tests/
     ├── conftest.py             # fixtureهای مشترک (جایگزین in-memory برای repository، LLM جعلی، کانکشن واقعی برای تست‌های DB)
     ├── test_reddit_source.py
@@ -245,6 +245,7 @@ reddit-telegram-digest/
     ├── test_analyzer.py
     ├── test_formatting.py
     ├── test_telegram_notifier.py
+    ├── test_main.py
     └── test_pipeline.py
 ```
 
@@ -252,7 +253,7 @@ reddit-telegram-digest/
 
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
 
-`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` دیگر نوتيفایر نمی‌سازد و `Pipeline` فقط یک seam قابل‌تزریق با پیش‌فرض همین تابع دارد.
+`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` هیچ نوتيفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: دو تابع ماژول‌سطح `run_once()` و `retry_pending_sends()` که هرکدام تنظیمات و موضوعات خودشان را می‌خوانند (`main.py` فقط `pipeline.run_once()` را در حلقه صدا می‌زند). تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
 
 ---
 
@@ -493,3 +494,9 @@ pytest
   4. **پیام بلندتر از ۴۰۹۶ کاراکتر فقط در سطح `WARNING` لاگ می‌شود و دست‌نخورده ارسال می‌شود**؛ کوتاه‌سازی همچنان مسئولیت `formatting.py` است (FR-10) — تفکیک مسئولیت‌ها حفظ شد.
   5. **retry روی تابع داخلی `_send_message_once`** با دکوریتور `retryable` اعمال می‌شود (نه روی `send_message`)، چون تنها همان لایه است که شکست را raise می‌کند تا backoff معنا داشته باشد؛ پیام‌های خطا همچنان پاک‌سازی‌شده‌اند تا توکن هرگز در لاگ نیفتد (Invariant 6، NFR-4).
   6. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — هستهٔ یکپارچه‌سازی: `pipeline` + `main`)** — بازآرایی `pipeline` طبق تصمیم صریح کاربر؛ این فایل حساس‌ترین جای پروژه است چون Invariantها همان‌جا واقعاً اجرا می‌شوند:
+  1. **پایان `Pipeline` کلاس‌محور** (بخش ۹): دو تابع ماژول‌سطح `run_once()` و `retry_pending_sends()` هرکدام تنظیمات/موضوعات خودشان را می‌خوانند و `main.py` بدون ساخت هیچ آبجکتی `pipeline.run_once()` را در حلقه صدا می‌زند. دلیل: همهٔ ماژول‌های دیگر (repository/analyzer/telegram_notifier) تابع ماژول‌سطح‌اند و کلاس هیچ حالتی را که لازم باشد نگه نمی‌داشت (Invariant 7).
+  2. **استثناها فقط یک‌جا مهار می‌شوند** (Invariant 8، بخش ۴.۱): در پردازش یک پست تنها `AnalysisError` به‌صورت خاص مدیریت می‌شود (ثبت `failed`، Invariant 3)؛ هر استثنای دیگر به گارد هر-پست در `run_once` می‌رسد که `log.exception` می‌کند و بقیهٔ پست‌ها ادامه می‌یابند. در مسیر خطای شبکه‌ای هیچ رکوردی نوشته نمی‌شود تا پست در دور بعد دوباره واکشی و تحلیل شود.
+  3. **assert دفاعی برای بازهٔ ایندکس کاندید** (Invariant 4): نگاشت ایندکس محلی → `id` واقعی تنها در `resolve_duplicate_id` انجام می‌شود و ایندکس خارج از بازه به‌جای حدس‌زدن، بلند خطا می‌دهد — چون `analyzer` از قبل چنین خروجی‌ای را رد می‌کند، رسیدن به آن یک باگ کد است نه خروجی بد مدل.
+  4. **`main.py`**: SIGTERM/SIGINT به همان مسیر Ctrl+C ترجمه می‌شود تا `docker stop` فوری و تمیز تمام شود (NFR-2) و سطح لاگ از `LOG_LEVEL` می‌آید (NFR-3).
+  5. ⚠️ پیش‌نیاز این فاز (افزودن `'skipped_low_importance'` به schema و بخش ۱۰) از قبل — با تغییرات فاز ۳/MVP — تأمین شده بود؛ در بازبینی کد تأیید شد که `db/schema.sql` و بخش ۱۰ هر دو همین مقدار را دارند، پس در این تغییر هیچ اصلاحی روی schema لازم نشد و هیچ Invariant‌ای تغییر نکرد.
