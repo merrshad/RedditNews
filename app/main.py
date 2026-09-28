@@ -1,10 +1,8 @@
 """Entry point: a simple periodic loop around one pipeline run (AGENTS.md section 8).
 
-No scheduler dependency on purpose (YAGNI): ``while True: run(); sleep(...)``.
-
-``SIGTERM`` is turned into the same ``KeyboardInterrupt`` path as Ctrl-C so that
-``docker stop`` leaves the worker cleanly instead of killing the process mid-cycle
-(NFR-2). Nothing here re-implements signal handling beyond that one seam.
+No scheduler dependency on purpose (YAGNI): ``while True: run_once(); sleep(...)``. Two
+guarantees matter here: a failing cycle must never kill the worker (NFR-2), and a
+``docker stop`` (SIGTERM) must end the process cleanly instead of waiting for the timeout.
 """
 
 from __future__ import annotations
@@ -14,9 +12,8 @@ import signal
 import sys
 import time
 
-from app.pipeline import Pipeline
-from app.reddit_source import TopicsConfig, load_topics_config
-from app.settings import Settings, get_settings
+from app import pipeline
+from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -33,64 +30,40 @@ def setup_logging(level: str) -> None:
     )
 
 
-def _exit_on_sigterm(signum: int, frame: object) -> None:
-    """Raise ``KeyboardInterrupt`` so SIGTERM follows the existing shutdown path.
+def _request_shutdown(_signum: int, _frame: object) -> None:
+    """Translate SIGTERM/SIGINT into the same clean exit path as Ctrl+C.
 
-    The repository writes are autocommit and one cycle is idempotent (Invariant 7),
-    so aborting a cycle mid-flight is safe: the next run simply picks the post up.
+    Raising ``KeyboardInterrupt`` also interrupts the ``time.sleep`` between cycles, so
+    the container stops immediately rather than after up to ``POLL_INTERVAL_SECONDS``.
     """
     raise KeyboardInterrupt
 
 
-def install_signal_handlers() -> None:
-    """Handle SIGTERM like Ctrl-C so ``docker stop`` exits the loop (NFR-2).
-
-    SIGINT already raises ``KeyboardInterrupt`` by default. Installing a handler is
-    only possible from the main thread, so a non-main-thread caller (some test
-    runners) is tolerated rather than fatal.
-    """
-    try:
-        signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    except ValueError:  # pragma: no cover - only reachable off the main thread
-        logger.warning("SIGTERM handler not installed: not running on the main thread")
-
-
-def run_once(settings: Settings, *, topics_config: TopicsConfig) -> None:
-    """Execute a single pipeline cycle (the repository opens its own connections)."""
-    Pipeline(
-        settings=settings,
-        topics_config=topics_config,
-    ).run_once()
-
-
-def run_forever(settings: Settings, *, topics_config: TopicsConfig) -> None:
-    """Poll forever; a failed cycle must never kill the worker (NFR-2)."""
-    while True:
-        try:
-            run_once(settings, topics_config=topics_config)
-        except Exception:
-            logger.exception("Pipeline cycle failed; retrying after the poll interval")
-
-        logger.info("Sleeping %d second(s) until the next cycle", settings.poll_interval_seconds)
-        time.sleep(settings.poll_interval_seconds)
+def _install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
 
 
 def main() -> None:
+    """Log, then poll forever; the pipeline reads its own settings and topics config."""
     settings = get_settings()
     setup_logging(settings.log_level)
-
-    topics_config = load_topics_config()
+    _install_signal_handlers()
     logger.info(
-        "Starting reddit-telegram-digest: %d topic(s), %d feed(s), model=%s, interval=%ds",
-        len(topics_config.topics),
-        sum(len(topic.feeds) for topic in topics_config.topics),
+        "Starting reddit-telegram-digest: model=%s, interval=%ds",
         settings.openai_model,
         settings.poll_interval_seconds,
     )
 
-    install_signal_handlers()
     try:
-        run_forever(settings, topics_config=topics_config)
+        while True:
+            try:
+                pipeline.run_once()
+            except Exception:
+                # The loop is the last safety net: nothing but a shutdown may end it.
+                logger.exception("Pipeline cycle failed; continuing after the poll interval")
+
+            time.sleep(settings.poll_interval_seconds)
     except KeyboardInterrupt:
         logger.info("Shutdown requested, exiting")
 

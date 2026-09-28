@@ -225,7 +225,7 @@ reddit-telegram-digest/
 │   └── schema.sql            # تنها منبع تغییر schema (بخش ۱۰)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # نقطه ورود: حلقه اجرای دوره‌ای + خروج تمیز روی SIGTERM
+│   ├── main.py                # نقطه ورود: حلقه `pipeline.run_once()` + خروج تمیز روی SIGTERM (NFR-2/NFR-3)
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
 │   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
 │   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all → FR-1
@@ -237,7 +237,7 @@ reddit-telegram-digest/
 │   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن (DRY، NFR-2)
-│   └── pipeline.py            # orchestration: اتصال همه ماژول‌های بالا به هم
+│   └── pipeline.py            # orchestration؛ API: run_once, retry_pending_sends → FR-1..FR-11
 └── tests/
     ├── conftest.py             # fixtureهای مشترک (جایگزین in-memory برای repository، LLM جعلی، کانکشن واقعی برای تست‌های DB)
     ├── test_reddit_source.py
@@ -245,17 +245,15 @@ reddit-telegram-digest/
     ├── test_analyzer.py
     ├── test_formatting.py
     ├── test_telegram_notifier.py
-    ├── test_pipeline.py
-    └── test_main.py
+    ├── test_main.py
+    └── test_pipeline.py
 ```
 
 هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
 
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
 
-`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` دیگر نوتيفایر نمی‌سازد و `Pipeline` فقط یک seam قابل‌تزریق با پیش‌فرض همین تابع دارد.
-
-`main.py` هم فقط یک حلقه است: هر چرخه یک `Pipeline` می‌سازد و `run_once()` را صدا می‌زند، خطای یک چرخه را لاگ می‌کند و اجازه نمی‌دهد worker بمیرد (NFR-2). همچنین یک handler برای `SIGTERM` نصب می‌کند که آن را به همان مسیر `KeyboardInterrupt` (Ctrl-C) تبدیل می‌کند تا `docker stop` تمیز خارج شود؛ چون `repository` با autocommit می‌نویسد و هر چرخه idempotent است (Invariant 7)، قطع‌شدن چرخه از وسط بی‌خطر است.
+`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` هیچ نوتيفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: دو تابع ماژول‌سطح `run_once()` و `retry_pending_sends()` که هرکدام تنظیمات و موضوعات خودشان را می‌خوانند (`main.py` فقط `pipeline.run_once()` را در حلقه صدا می‌زند). تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
 
 ---
 
@@ -497,8 +495,10 @@ pytest
   4. **پیام بلندتر از ۴۰۹۶ کاراکتر فقط در سطح `WARNING` لاگ می‌شود و دست‌نخورده ارسال می‌شود**؛ کوتاه‌سازی همچنان مسئولیت `formatting.py` است (FR-10) — تفکیک مسئولیت‌ها حفظ شد.
   5. **retry روی تابع داخلی `_send_message_once`** با دکوریتور `retryable` اعمال می‌شود (نه روی `send_message`)، چون تنها همان لایه است که شکست را raise می‌کند تا backoff معنا داشته باشد؛ پیام‌های خطا همچنان پاک‌سازی‌شده‌اند تا توکن هرگز در لاگ نیفتد (Invariant 6، NFR-4).
   6. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
-- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — هسته یکپارچه‌سازی)** — تثبیت `app/pipeline.py` + `app/main.py` و هم‌راستا کردن سند با آن:
-  1. **خروج تمیز روی `SIGTERM`** (بخش ۹): `main.py` یک handler نصب می‌کند که `SIGTERM` را به همان مسیر `KeyboardInterrupt` (Ctrl-C) تبدیل می‌کند تا `docker stop` worker را وسط چرخه نکشد. دلیل: هر چرخه idempotent است و `repository` با autocommit می‌نویسد (Invariant 7)، پس قطع چرخه امن است؛ نصب handler فقط در main thread ممکن است، بنابراین `ValueError` تحمل می‌شود نه آنکه مرگبار باشد.
-  2. **شش رفتار فاز ۳ روی Postgres واقعی تست شدند** (بخش ۱۳): همان سناریوهایی که `tests/test_pipeline.py` قبلاً با repository درون‌حافظه‌ای پوشش می‌داد، حالا با `repository` واقعی هم اجرا می‌شوند — ذخیره‌قبل‌از‌ارسال و ارسال دقیقاً یک‌بار (FR-9/FR-10)، رد کردن پست موجود بدون تماس دوباره LLM (Invariant 1)، نگاشت ایندکس کاندید شماره ۲ به `id` واقعی همان ردیف و نه عدد ۲ (Invariant 4)، `skipped_low_importance` بدون ارسال (FR-10 شرط ج)، `failed` برای خروجی نامعتبر LLM بدون متوقف کردن بقیه پست‌ها (Invariant 3 و 8)، و بازیابی ارسال ناموفق در دور بعد (FR-11).
-  3. **افزودن `tests/test_main.py`** (بخش ۹): نصب شدن handler، تبدیل `SIGTERM` به `KeyboardInterrupt`، و زنده‌ماندن worker بعد از یک چرخهٔ خطادار (NFR-2) را تضمین می‌کند.
-  4. **هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است**: مقدار `status` موردنیاز این فاز (`skipped_low_importance`) از قبل طبق ردیف اول همین Changelog هم در `db/schema.sql` و هم در بخش ۱۰ وجود داشت (FR-10 شرط ج)، پس پیش‌نیاز این فاز چیزی برای اضافه‌کردن نداشت.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — هستهٔ یکپارچه‌سازی: `pipeline` + `main`)** — بازآرایی `pipeline` طبق تصمیم صریح کاربر؛ این فایل حساس‌ترین جای پروژه است چون Invariantها همان‌جا واقعاً اجرا می‌شوند:
+  1. **پایان `Pipeline` کلاس‌محور** (بخش ۹): دو تابع ماژول‌سطح `run_once()` و `retry_pending_sends()` هرکدام تنظیمات/موضوعات خودشان را می‌خوانند و `main.py` بدون ساخت هیچ آبجکتی `pipeline.run_once()` را در حلقه صدا می‌زند. دلیل: همهٔ ماژول‌های دیگر (repository/analyzer/telegram_notifier) تابع ماژول‌سطح‌اند و کلاس هیچ حالتی را که لازم باشد نگه نمی‌داشت (Invariant 7).
+  2. **استثناها فقط یک‌جا مهار می‌شوند** (Invariant 8، بخش ۴.۱): در پردازش یک پست تنها `AnalysisError` به‌صورت خاص مدیریت می‌شود (ثبت `failed`، Invariant 3)؛ هر استثنای دیگر به گارد هر-پست در `run_once` می‌رسد که `log.exception` می‌کند و بقیهٔ پست‌ها ادامه می‌یابند. در مسیر خطای شبکه‌ای هیچ رکوردی نوشته نمی‌شود تا پست در دور بعد دوباره واکشی و تحلیل شود.
+  3. **assert دفاعی برای بازهٔ ایندکس کاندید** (Invariant 4): نگاشت ایندکس محلی → `id` واقعی تنها در `resolve_duplicate_id` انجام می‌شود و ایندکس خارج از بازه به‌جای حدس‌زدن، بلند خطا می‌دهد — چون `analyzer` از قبل چنین خروجی‌ای را رد می‌کند، رسیدن به آن یک باگ کد است نه خروجی بد مدل.
+  4. **`main.py`**: SIGTERM/SIGINT به همان مسیر Ctrl+C ترجمه می‌شود تا `docker stop` فوری و تمیز تمام شود (NFR-2) و سطح لاگ از `LOG_LEVEL` می‌آید (NFR-3).
+  5. ⚠️ پیش‌نیاز این فاز (افزودن `'skipped_low_importance'` به schema و بخش ۱۰) از قبل — با تغییرات فاز ۳/MVP — تأمین شده بود؛ در بازبینی کد تأیید شد که `db/schema.sql` و بخش ۱۰ هر دو همین مقدار را دارند، پس در این تغییر هیچ اصلاحی روی schema لازم نشد و هیچ Invariant‌ای تغییر نکرد.
+- **۲۰۲۶-۰۹-۲۸ (فاز ۳ — پوشش Postgres واقعی برای هستهٔ یکپارچه‌سازی)** — پنج سناریوی فاز ۳ که تا این‌جا فقط با `repository` درون‌حافظه‌ای تست می‌شدند، حالا یک‌بار هم با `repository` واقعی و از طریق `db/schema.sql` اجرا می‌شوند: ذخیره‌قبل‌از‌ارسال و ارسال دقیقاً یک‌بار (FR-9/FR-10)، رد کردن پست موجود بدون تماس دوبارهٔ LLM در دور بعد (Invariant 1)، نگاشت ایندکس کاندید شمارهٔ ۲ به `id` واقعی همان ردیف و نه عدد ۲ (Invariant 4)، `skipped_low_importance` بدون ارسال (FR-10 شرط ج)، و `failed` برای خروجی نامعتبر LLM بدون توقف بقیهٔ پست‌ها (Invariant 3 و 8). دلیل: تنها بازیابی ارسال ناموفق (FR-11) از قبل روی Postgres واقعی تست می‌شد و بقیهٔ مسیرها فقط با fake اثبات شده بودند؛ برای حساس‌ترین فایل پروژه اثبات روی خودِ دیتابیس لازم است. هیچ Invariant‌ای تغییر نکرد و `db/schema.sql` دست‌نخورده است.
