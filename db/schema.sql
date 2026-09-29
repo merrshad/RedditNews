@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS posts (
 
     -- review audit trail (FR-12)
     reviewed_by         TEXT,                        -- Telegram user id of the deciding admin
+    reviewed_by_name    TEXT,                        -- that admin's display name (phase 6)
     reviewed_at         TIMESTAMPTZ,
     approved_at         TIMESTAMPTZ,
     rejected_at         TIMESTAMPTZ,

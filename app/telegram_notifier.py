@@ -1,9 +1,9 @@
 """The whole Telegram Bot API boundary for this project (AGENTS.md sections 8 and 9).
 
-Still no bot framework (YAGNI): plain HTTP calls through ``httpx``. What changed in
-phase 5 is that the bot is no longer one-way — the private review channel carries inline
-buttons, so the same module also performs the one inbound call, ``getUpdates``, which
-``app.telegram_updates`` long-polls.
+Still no bot framework (YAGNI): plain HTTP calls through ``httpx``. Phase 6 makes every
+call awaitable — the worker is one asyncio event loop, so a send, an edit or a long poll
+never blocks a button press that is being handled at the same time. The same module also
+performs the one inbound call, ``getUpdates``, which ``app.telegram_updates`` long-polls.
 
 Every function in the public API answers with a value instead of raising, so the caller
 decides what a failure means: ``None``/``False`` for send/edit/answer, ``[]`` for updates.
@@ -17,13 +17,12 @@ URL, so failures are described with a sanitised message instead of httpx's own t
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from app.retry import PermanentError, retryable
+from app.retry import PermanentError, async_sleep, retryable
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -50,10 +49,6 @@ MAX_RETRY_AFTER_SECONDS = 30.0
 # Telegram's hard limit for a single message. Truncating is formatting.py's job
 # (FR-10), so this module only reports the anomaly (see :func:`send_message`).
 TELEGRAM_MESSAGE_LIMIT = 4096
-
-# An inline keyboard with zero rows: what Telegram expects when the buttons must go while
-# the message itself stays (FR-12 — the review message is the audit trail, never deleted).
-REMOVE_KEYBOARD: dict[str, Any] = {"inline_keyboard": []}
 
 INLINE_BUTTON_CALLBACK = "callback_query"
 PLAIN_MESSAGE = "message"
@@ -97,8 +92,19 @@ def _retry_after_seconds(response: httpx.Response, body: dict[str, Any]) -> floa
     return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
 
 
+async def _request(url: str, *, payload: dict[str, Any], timeout: float) -> httpx.Response:
+    """One HTTP round trip to the Bot API — the only place that touches the network.
+
+    A client per call is deliberate (KISS, and the module stays stateless): Telegram's own
+    rate limits, not connection reuse, decide the throughput of a burst, and one long-poll
+    request every 25 seconds does not need a pool. Tests replace this single seam.
+    """
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.post(url, json=payload)
+
+
 @retryable(description=_describe_call)
-def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) -> Any:
+async def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) -> Any:
     """One Bot API call; raises :class:`TelegramError` on any failure.
 
     ``retryable`` wraps *this* call because only here does a failure raise; the public
@@ -106,9 +112,9 @@ def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) 
     """
     token = get_settings().telegram_bot_token
     try:
-        response = httpx.post(
+        response = await _request(
             f"{TELEGRAM_API_BASE}/bot{token}/{method}",
-            json=payload,
+            payload=payload,
             timeout=timeout_seconds,
         )
     except httpx.HTTPError as exc:
@@ -136,13 +142,13 @@ def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) 
                     method,
                     delay,
                 )
-                time.sleep(delay)
+                await async_sleep(delay)
         raise TelegramError(message)
 
     return body.get("result")
 
 
-def send_message(
+async def send_message(
     text: str,
     *,
     chat_id: str | None = None,
@@ -174,7 +180,9 @@ def send_message(
         payload["reply_markup"] = reply_markup
 
     try:
-        result = _call_once("sendMessage", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS)
+        result = await _call_once(
+            "sendMessage", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS
+        )
     except TelegramError as exc:  # includes TelegramPermanentError: same answer, no retries
         logger.error("Telegram send failed, keeping the post for a later run: %s", exc)
         return None
@@ -193,38 +201,39 @@ def send_message(
     return int(message_id)
 
 
-def edit_message_text(
-    text: str,
-    *,
-    chat_id: str,
-    message_id: int,
-    reply_markup: dict[str, Any] | None = None,
+async def edit_message_reply_markup(
+    *, chat_id: str, message_id: int, reply_markup: dict[str, Any]
 ) -> bool:
-    """Rewrite a message we already sent, buttons included — FR-12.
+    """Replace only a message's inline keyboard and leave its text untouched — FR-12.
 
-    The review message is edited in place and never deleted: ``reply_markup`` defaults to
-    :data:`REMOVE_KEYBOARD` so that deciding a post also takes its buttons away.
+    This is the phase-6 fix for the review channel: rewriting the *text* replaced the whole
+    post with a one-line status, which read as if the post had been deleted. Telegram has a
+    dedicated method for the buttons, so the post body stays byte-identical and the message
+    keeps working as the audit trail.
+
+    There is deliberately no ``editMessageText`` wrapper: the review message must never be
+    rewritten again, and leaving the method out is what makes that structural instead of a
+    convention somebody has to remember.
     """
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-        "reply_markup": REMOVE_KEYBOARD if reply_markup is None else reply_markup,
+        "reply_markup": reply_markup,
     }
 
     try:
-        _call_once("editMessageText", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS)
+        await _call_once(
+            "editMessageReplyMarkup", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS
+        )
     except TelegramError as exc:
-        logger.error("Telegram message edit failed (message_id=%s): %s", message_id, exc)
+        logger.error("Telegram keyboard edit failed (message_id=%s): %s", message_id, exc)
         return False
 
-    logger.info("Telegram message %s updated", message_id)
+    logger.info("Telegram message %s keyboard updated", message_id)
     return True
 
 
-def answer_callback_query(callback_query_id: str, *, text: str | None = None) -> bool:
+async def answer_callback_query(callback_query_id: str, *, text: str | None = None) -> bool:
     """Close the spinner on a pressed button, optionally with a short note (FR-12).
 
     Telegram requires an answer for every callback query, otherwise the client keeps
@@ -236,20 +245,22 @@ def answer_callback_query(callback_query_id: str, *, text: str | None = None) ->
         payload["show_alert"] = False
 
     try:
-        _call_once("answerCallbackQuery", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS)
+        await _call_once(
+            "answerCallbackQuery", payload, timeout_seconds=REQUEST_TIMEOUT_SECONDS
+        )
     except TelegramError as exc:
         logger.warning("Could not answer a callback query: %s", exc)
         return False
     return True
 
 
-def get_updates(
+async def get_updates(
     *,
     offset: int | None = None,
     long_poll_seconds: int = LONG_POLL_SECONDS,
     allowed_updates: Sequence[str] = (INLINE_BUTTON_CALLBACK, PLAIN_MESSAGE),
 ) -> list[dict[str, Any]]:
-    """Long-poll for admin decisions and commands — FR-12/FR-15.
+    """Long-poll for admin decisions and button presses — FR-12/FR-15.
 
     ``offset`` is Telegram's "give me updates after this id" cursor. A failure (or a
     Telegram outage) answers ``[]`` so the worker loop keeps running (NFR-2): nothing is
@@ -264,7 +275,7 @@ def get_updates(
         payload["offset"] = offset
 
     try:
-        result = _call_once(
+        result = await _call_once(
             "getUpdates", payload, timeout_seconds=LONG_POLL_HTTP_TIMEOUT_SECONDS
         )
     except TelegramError as exc:

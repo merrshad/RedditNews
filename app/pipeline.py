@@ -17,12 +17,20 @@ purpose: a test swaps ``app.pipeline.fetch_all`` / ``analyze`` / ``send_message`
 fake instead of touching the network or Telegram (NFR-8). Every failure is contained per
 post, so one bad post can never stop the rest of the run (Invariant 8), and the module
 holds no state between runs (Invariant 7).
+
+Everything here is awaitable (phase 6). The stages that were a plain ``for`` loop are now
+``asyncio.gather`` fan-outs bounded by a small semaphore — a post's analysis or publication
+is an independent network round trip, and doing 20 of them one after another was the main
+reason a busy cycle felt slow. The order of the *stages* is untouched, and the per-post
+try/except that Invariant 8 relies on is still there, just inside the concurrent worker.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import TypeVar
 
 from app import repository, review, telegram_notifier
 from app.analyzer import AnalysisError, analyze
@@ -41,6 +49,35 @@ from app.reddit_source import fetch_all, topic_display_names
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+# How many posts may be in flight at once. Kept small on purpose: the free LLM endpoint
+# rate-limits, and Telegram throttles a burst of sends, so a handful of overlapping calls
+# is where the latency win stops and the 429s start (NFR-6).
+MAX_CONCURRENT_ANALYSES = 3
+MAX_CONCURRENT_PUBLICATIONS = 3
+
+T = TypeVar("T")
+
+
+async def _run_bounded(
+    items: Sequence[T], worker: Callable[[T], Awaitable[None]], *, limit: int
+) -> None:
+    """Run ``worker`` over every item concurrently, at most ``limit`` at a time.
+
+    ``worker`` owns the per-item error handling, so this helper never sees a failure: one
+    bad post still cannot stop the others (Invariant 8). An empty ``items`` is a no-op, and
+    with a fake Telegram client that never yields, the items are visited in order — which is
+    what keeps the tests deterministic.
+    """
+    if not items:
+        return
+    gate = asyncio.Semaphore(limit)
+
+    async def _gated(item: T) -> None:
+        async with gate:
+            await worker(item)
+
+    await asyncio.gather(*(_gated(item) for item in items))
 
 
 # --- pure decisions (no I/O, so they are unit-testable on their own) --------------
@@ -122,7 +159,7 @@ def build_post_record(
 # --- entry points -----------------------------------------------------------------
 
 
-def run_once() -> None:
+async def run_once() -> None:
     """One full pipeline cycle; one bad post never stops the others (Invariant 8)."""
     logger.info("Pipeline run started")
 
@@ -131,23 +168,23 @@ def run_once() -> None:
     topic_names = topic_display_names(topics)
 
     # FR-11 and FR-13 before anything new: finish what an earlier run left behind.
-    process_approved_posts(topic_names=topic_names, topics=topics, settings=settings)
+    await process_approved_posts(topic_names=topic_names, topics=topics, settings=settings)
 
     # FR-1/FR-2: fetch the active sources and store what is new, capped per source.
     sources = repository.list_sources(active_only=True)
     if sources:
-        stored = store_new_posts(sources, default_fetch_limit=settings.rss_fetch_limit)
+        stored = await store_new_posts(sources, default_fetch_limit=settings.rss_fetch_limit)
         logger.info("Stored %d new post(s)", stored)
     else:
         logger.warning("No active source is configured; nothing to fetch (FR-14)")
 
     # FR-12: every stored post waits for a human, one message per post.
-    review.dispatch_pending_reviews(topic_names)
+    await review.dispatch_pending_reviews(topic_names)
 
     logger.info("Pipeline run finished")
 
 
-def process_approved_posts(
+async def process_approved_posts(
     *,
     topic_names: Mapping[str, str] | None = None,
     topics: Sequence[TopicRecord] | None = None,
@@ -163,15 +200,17 @@ def process_approved_posts(
     topic_names = _topic_names(topic_names)
     topics = list(topics) if topics is not None else repository.list_topics(active_only=True)
 
-    retry_pending_sends(topic_names=topic_names)
+    # FR-11 first: retrying finished publications is pure Telegram traffic and must not
+    # queue behind a slow batch of model calls.
+    await retry_pending_sends(topic_names=topic_names)
 
     if not topics:
         logger.warning("No active topic is configured; the approved queue cannot be analysed")
         return
-    analyze_approved_posts(topics=list(topics), settings=settings, topic_names=topic_names)
+    await analyze_approved_posts(topics=list(topics), settings=settings, topic_names=topic_names)
 
 
-def retry_pending_sends(*, topic_names: Mapping[str, str] | None = None) -> None:
+async def retry_pending_sends(*, topic_names: Mapping[str, str] | None = None) -> None:
     """FR-11 — publish the posts an earlier run left as ``to_send``.
 
     ``repository.fetch_pending_to_send`` only returns rows that were already analysed and
@@ -182,36 +221,47 @@ def retry_pending_sends(*, topic_names: Mapping[str, str] | None = None) -> None
         return
 
     logger.info("Retrying %d pending publication(s) from earlier runs", len(pending))
-    topic_names = _topic_names(topic_names)
-    for record in pending:
+    resolved = _topic_names(topic_names)
+
+    async def _retry(record: PostRecord) -> None:
         try:
-            _publish(record, topic_names=topic_names)
+            await _publish(record, topic_names=resolved)
         except Exception:
             # Expected rejections come back as False instead; only the unexpected lands here.
             logger.exception(
                 "Unexpected failure while publishing reddit_id=%s; continuing", record.reddit_id
             )
 
+    await _run_bounded(pending, _retry, limit=MAX_CONCURRENT_PUBLICATIONS)
 
-def analyze_approved_posts(
+
+async def analyze_approved_posts(
     *, topics: list[TopicRecord], settings: Settings, topic_names: Mapping[str, str]
 ) -> None:
-    """FR-13 — one LLM call per approved post, then publish what qualifies."""
+    """FR-13 — one LLM call per approved post, then publish what qualifies.
+
+    The model calls run a few at a time: a free endpoint answers in seconds but a slow one
+    answers in minutes, and five approved posts waiting on each other was most of the delay
+    an admin noticed after pressing ✅ a few times.
+    """
     approved = repository.fetch_approved_for_analysis()
     if not approved:
         return
 
     logger.info("Analysing %d approved post(s)", len(approved))
-    for record in approved:
+
+    async def _analyse(record: PostRecord) -> None:
         try:
-            _analyze_one(record, topics=topics, settings=settings, topic_names=topic_names)
+            await _analyze_one(record, topics=topics, settings=settings, topic_names=topic_names)
         except Exception:
             logger.exception(
                 "Unexpected failure while analysing reddit_id=%s; continuing", record.reddit_id
             )
 
+    await _run_bounded(approved, _analyse, limit=MAX_CONCURRENT_ANALYSES)
 
-def store_new_posts(
+
+async def store_new_posts(
     sources: Sequence[SourceRecord], *, default_fetch_limit: int
 ) -> int:
     """FR-1/FR-2 — fetch, drop what is already stored, and insert the rest as ``new``.
@@ -219,7 +269,7 @@ def store_new_posts(
     Nothing here touches the LLM: a freshly stored post goes to the review channel first
     (FR-12), and only an admin's ✅ puts it in the analysis queue (FR-13).
     """
-    posts = fetch_all(sources, default_fetch_limit=default_fetch_limit)
+    posts = await fetch_all(sources, default_fetch_limit=default_fetch_limit)
     stored = 0
 
     for post in posts:
@@ -239,7 +289,7 @@ def store_new_posts(
 # --- per-post stages --------------------------------------------------------------
 
 
-def _analyze_one(
+async def _analyze_one(
     record: PostRecord,
     *,
     topics: list[TopicRecord],
@@ -257,7 +307,7 @@ def _analyze_one(
     )
 
     try:
-        analysis = analyze(_as_raw_post(record), list(candidates), topics)
+        analysis = await analyze(_as_raw_post(record), list(candidates), topics)
     except AnalysisError as exc:
         # Invariant 3: an answer that failed validation is stored as failed and never
         # treated as relevant/not-a-duplicate.
@@ -270,7 +320,7 @@ def _analyze_one(
             status="failed",
             ai_error=str(exc),
         )
-        review.announce_analysis_failed(record)
+        await review.announce_analysis_failed(record)
         return
 
     # Any other exception (the LLM/network still down after HTTP_MAX_RETRIES) is left to
@@ -294,13 +344,15 @@ def _analyze_one(
 
     logger.info("id=%s reviewed and analysed -> status=%s", record.id, status)
     if status != "to_send":
-        review.announce_skipped(record, status=status)
+        await review.announce_skipped(record, status=status)
         return
 
-    _publish(_analysed(record, analysis, duplicate_of_id=duplicate_of_id), topic_names=topic_names)
+    await _publish(
+        _analysed(record, analysis, duplicate_of_id=duplicate_of_id), topic_names=topic_names
+    )
 
 
-def _publish(record: PostRecord, *, topic_names: Mapping[str, str]) -> bool:
+async def _publish(record: PostRecord, *, topic_names: Mapping[str, str]) -> bool:
     """Publish one *analysed* post to the public channel (FR-10, Invariant 12).
 
     The publication claim is taken first, so exactly one caller may talk to Telegram for a
@@ -317,7 +369,7 @@ def _publish(record: PostRecord, *, topic_names: Mapping[str, str]) -> bool:
 
     text = format_message(record, topic_name=_topic_label(record, topic_names))
     channel_id = get_settings().telegram_chat_id
-    message_id = telegram_notifier.send_message(text)
+    message_id = await telegram_notifier.send_message(text)
     if message_id is None:
         repository.release_publish_claim(record.id)
         logger.error(
@@ -328,7 +380,7 @@ def _publish(record: PostRecord, *, topic_names: Mapping[str, str]) -> bool:
 
     repository.mark_published(record.id, channel_id=channel_id, message_id=message_id)
     logger.info("Published reddit_id=%s (id=%s)", record.reddit_id, record.id)
-    review.announce_published(record)
+    await review.announce_published(record)
     return True
 
 

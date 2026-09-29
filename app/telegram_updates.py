@@ -1,10 +1,9 @@
-"""Intake of Telegram updates: the cursor and the routing (FR-12).
+"""Intake of Telegram updates: the cursor and the routing (FR-12, FR-14).
 
-Phase 5 makes the bot two-way, and this is the only place that knows about Telegram's
-``update_id`` cursor. The worker loop itself long-polls it (``main.run_forever``), so a
-button press is acted on within seconds while the pipeline keeps its own
-``POLL_INTERVAL_SECONDS`` schedule — one process, no queue and no threading
-(AGENTS.md section 8).
+The bot is two-way, and this is the only place that knows about Telegram's ``update_id``
+cursor. Since phase 6 the worker has a task of its own for this (``main._updates_loop``),
+so updates are consumed continuously while the RSS/analysis cycle runs in the same event
+loop — a button press never waits for a cycle to finish.
 
 Telegram keeps undelivered updates for 24 hours, and the cursor only advances once an
 update was handled, so a restart or an outage loses nothing.
@@ -25,19 +24,19 @@ from app.telegram_notifier import (
 
 logger = logging.getLogger(__name__)
 
-# Update kinds the worker listens to: button presses (the review decisions) and plain
-# messages (the admin panel, app/admin.py).
+# Update kinds the worker listens to: button presses (review decisions and the admin
+# panel) and plain messages (which open the panel, or answer its prompt).
 ALLOWED_UPDATES: tuple[str, ...] = (INLINE_BUTTON_CALLBACK, PLAIN_MESSAGE)
 
 
 class PollResult(NamedTuple):
-    """What one long-poll produced: the next cursor and how many rows it changed."""
+    """What one long-poll produced: the next cursor and how many decisions it applied."""
 
     offset: int | None
     decisions: int
 
 
-def poll_once(
+async def poll_once(
     offset: int | None = None, *, long_poll_seconds: int = LONG_POLL_SECONDS
 ) -> PollResult:
     """Fetch pending updates, handle them, and return the next cursor.
@@ -46,7 +45,7 @@ def poll_once(
     run the analysis/publication step immediately instead of waiting for the next
     scheduled cycle.
     """
-    updates = get_updates(
+    updates = await get_updates(
         offset=offset, long_poll_seconds=long_poll_seconds, allowed_updates=ALLOWED_UPDATES
     )
 
@@ -57,7 +56,7 @@ def poll_once(
             # Offset is "give me updates after this id"; advance past what we just saw.
             offset = update_id + 1 if offset is None else max(offset, update_id + 1)
         try:
-            if route(update):
+            if await route(update):
                 decisions += 1
         except Exception:
             # One malformed update must not end the loop (NFR-2).
@@ -66,16 +65,22 @@ def poll_once(
     return PollResult(offset=offset, decisions=decisions)
 
 
-def route(update: dict[str, Any]) -> bool:
-    """Hand one update to the module that owns it; anything unknown is ignored."""
+async def route(update: dict[str, Any]) -> bool:
+    """Hand one update to the module that owns it; anything unknown is ignored.
+
+    Two callback namespaces live side by side, so the prefix — not the order of attempts —
+    decides who answers: ``panel:`` is the admin panel (FR-14) and everything else is a
+    review button (FR-12).
+    """
     callback_query = update.get("callback_query")
     if isinstance(callback_query, dict):
-        # A button press: the review decision and its message update.
-        return review.handle_callback(callback_query)
+        if admin.is_panel_callback(str(callback_query.get("data") or "")):
+            return await admin.handle_callback(callback_query)
+        return await review.handle_callback(callback_query)
 
     message = update.get("message")
     if isinstance(message, dict):
-        # A chat message: the admin command surface.
-        return admin.handle_command(message)
+        # A chat message: the panel's home screen, or the answer to a pending prompt.
+        return await admin.handle_message(message)
 
     return False

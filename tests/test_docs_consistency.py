@@ -21,6 +21,7 @@ from typing import get_args
 import pytest
 
 from app import (
+    admin,
     analyzer,
     formatting,
     pipeline,
@@ -187,12 +188,16 @@ def test_every_host_path_docker_compose_mounts_exists() -> None:
         (repository, "find_unusable_tables"),
         (analyzer, "analyze"),
         (telegram_notifier, "send_message"),
-        (telegram_notifier, "edit_message_text"),
+        (telegram_notifier, "edit_message_reply_markup"),
         (telegram_notifier, "answer_callback_query"),
         (telegram_notifier, "get_updates"),
         (review, "dispatch_pending_reviews"),
         (review, "handle_callback"),
+        (review, "keyboard_for"),
+        (admin, "handle_message"),
+        (admin, "handle_callback"),
         (telegram_updates, "poll_once"),
+        (telegram_updates, "route"),
         (formatting, "format_message"),
         (pipeline, "run_once"),
         (pipeline, "process_approved_posts"),
@@ -223,7 +228,7 @@ def test_the_posts_columns_count_is_guarded() -> None:
     """A canary for the regex above: the review/audit columns are really there."""
     real = _column_names(_create_table_block(SCHEMA_PATH.read_text(encoding="utf-8"), "posts"))
 
-    assert len(real) == 31
+    assert len(real) == 32
 
 
 @pytest.mark.parametrize(

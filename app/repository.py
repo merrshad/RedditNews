@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 # One column list for every read, in the order PostRecord expects them.
 _POST_COLUMNS = """
 id, reddit_id, subreddit, source_topic_key, title, url, author, raw_content,
-posted_at, status, review_status, reviewed_by, reviewed_at, approved_at, rejected_at,
-private_channel_id, private_message_id, is_relevant, duplicate_of_id, topic, importance,
-summary_fa, key_points, llm_raw_response, ai_processed_at, ai_error,
+posted_at, status, review_status, reviewed_by, reviewed_by_name, reviewed_at, approved_at,
+rejected_at, private_channel_id, private_message_id, is_relevant, duplicate_of_id, topic,
+importance, summary_fa, key_points, llm_raw_response, ai_processed_at, ai_error,
 public_channel_id, public_message_id, published_at
 """
 
@@ -113,14 +113,14 @@ RETURNING id
 # simultaneous clicks wins (Invariant 12); the loser gets False and a "already reviewed".
 _APPROVE_SQL = """
 UPDATE posts SET review_status = 'approved', status = 'approved', reviewed_by = %s,
-                 reviewed_at = now(), approved_at = now()
+                 reviewed_by_name = %s, reviewed_at = now(), approved_at = now()
 WHERE id = %s AND status = 'awaiting_review' AND review_status = 'pending_review'
 RETURNING id
 """
 
 _REJECT_SQL = """
 UPDATE posts SET review_status = 'rejected', status = 'rejected', reviewed_by = %s,
-                 reviewed_at = now(), rejected_at = now()
+                 reviewed_by_name = %s, reviewed_at = now(), rejected_at = now()
 WHERE id = %s AND status = 'awaiting_review' AND review_status = 'pending_review'
 RETURNING id
 """
@@ -426,18 +426,31 @@ def mark_review_dispatched(post_id: int, *, channel_id: str, message_id: int) ->
     return won
 
 
-def decide_review(post_id: int, *, decision: ReviewDecision, admin_id: str) -> bool:
+def decide_review(
+    post_id: int,
+    *,
+    decision: ReviewDecision,
+    admin_id: str,
+    admin_name: str | None = None,
+) -> bool:
     """FR-12/Invariant 12 — record the admin's decision, exactly once.
 
     ``True`` means this call is the one that made the decision; ``False`` means the post
-    was already approved or rejected (the second admin gets told so).
+    was already approved or rejected (the second admin gets told so). ``admin_id`` is the
+    authority; ``admin_name`` is the display name the review message shows (phase 6).
     """
     sql = _APPROVE_SQL if decision == "approved" else _REJECT_SQL
     with _connection() as connection, connection.cursor() as cursor:
-        cursor.execute(sql, (admin_id, post_id))
+        cursor.execute(sql, (admin_id, admin_name, post_id))
         won = cursor.fetchone() is not None
     if won:
-        logger.info("id=%s review decision: %s by admin %s", post_id, decision, admin_id)
+        logger.info(
+            "id=%s review decision: %s by admin %s (%s)",
+            post_id,
+            decision,
+            admin_id,
+            admin_name or "no display name",
+        )
     else:
         logger.info("id=%s review decision: %s ignored (already reviewed)", post_id, decision)
     return won

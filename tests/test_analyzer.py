@@ -8,7 +8,7 @@ import pytest
 
 from app.analyzer import AnalysisError, analyze, build_user_prompt, load_system_prompt
 from app.models import LlmAnalysis, PostRecord, RawPost, TopicRecord
-from tests.conftest import FakeChatCompletion
+from tests.conftest import FakeChatCompletion, run
 
 ALLOWED_TOPICS = [
     TopicRecord(key="ai", name="هوش مصنوعی"),
@@ -98,7 +98,7 @@ def test_build_user_prompt_exposes_local_indexes_but_not_database_ids() -> None:
 def test_analyze_returns_a_validated_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_answer(monkeypatch, json.dumps(VALID_ANSWER, ensure_ascii=False))
 
-    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+    analysis = run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     assert isinstance(analysis, LlmAnalysis)
     assert analysis.is_relevant is True
@@ -113,7 +113,7 @@ def test_analyze_makes_one_call_with_the_named_and_indexed_candidates(
 ) -> None:
     fake = _mock_answer(monkeypatch, json.dumps(VALID_ANSWER, ensure_ascii=False))
 
-    analyze(_post(), _candidates(), ALLOWED_TOPICS)
+    run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     assert len(fake.calls) == 1
     system_prompt, user_prompt = fake.calls[0]
@@ -128,7 +128,7 @@ def test_analyze_returns_the_raw_candidate_index_without_mapping_it_to_an_id(
     answer = {**VALID_ANSWER, "duplicate_of_candidate_index": 2}
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
-    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+    analysis = run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     # Candidate 2 has database id 12, but analyze must not resolve that (Invariant 4).
     assert analysis.duplicate_of_candidate_index == 2
@@ -141,7 +141,7 @@ def test_analyze_rejects_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_answer(monkeypatch, "I cannot answer that.")
 
     with pytest.raises(AnalysisError):
-        analyze(_post(), _candidates(), ALLOWED_TOPICS)
+        run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
 
 def test_analyze_rejects_a_missing_required_field(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,7 +149,7 @@ def test_analyze_rejects_a_missing_required_field(monkeypatch: pytest.MonkeyPatc
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
     with pytest.raises(AnalysisError):
-        analyze(_post(), _candidates(), ALLOWED_TOPICS)
+        run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
 
 def test_analyze_rejects_a_topic_outside_the_allowed_topics(
@@ -159,7 +159,7 @@ def test_analyze_rejects_a_topic_outside_the_allowed_topics(
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
     with pytest.raises(AnalysisError):
-        analyze(_post(), _candidates(), ALLOWED_TOPICS)
+        run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
 
 def test_analyze_rejects_a_duplicate_index_outside_the_sent_candidates(
@@ -169,7 +169,7 @@ def test_analyze_rejects_a_duplicate_index_outside_the_sent_candidates(
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
     with pytest.raises(AnalysisError):
-        analyze(_post(), _candidates(), ALLOWED_TOPICS)
+        run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
 
 def test_analyze_rejects_a_duplicate_index_when_no_candidate_was_sent(
@@ -179,7 +179,7 @@ def test_analyze_rejects_a_duplicate_index_when_no_candidate_was_sent(
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
     with pytest.raises(AnalysisError):
-        analyze(_post(), [], ALLOWED_TOPICS)
+        run(analyze(_post(), [], ALLOWED_TOPICS))
 
 
 def test_analyze_accepts_more_key_points_than_the_prompt_asks_for(
@@ -196,7 +196,7 @@ def test_analyze_accepts_more_key_points_than_the_prompt_asks_for(
     answer = {**VALID_ANSWER, "key_points": [f"نکته {index}" for index in range(1, 8)]}
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
-    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+    analysis = run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     assert len(analysis.key_points) == 7  # kept as-is, not truncated and not rejected
 
@@ -206,7 +206,7 @@ def test_analyze_accepts_no_key_points_at_all(monkeypatch: pytest.MonkeyPatch) -
     answer = {**VALID_ANSWER, "key_points": []}
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
-    analysis = analyze(_post(), _candidates(), ALLOWED_TOPICS)
+    analysis = run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     assert analysis.key_points == []
 
@@ -218,6 +218,6 @@ def test_analysis_error_keeps_the_parsed_answer_for_the_audit_column(
     _mock_answer(monkeypatch, json.dumps(answer, ensure_ascii=False))
 
     with pytest.raises(AnalysisError) as excinfo:
-        analyze(_post(), _candidates(), ALLOWED_TOPICS)
+        run(analyze(_post(), _candidates(), ALLOWED_TOPICS))
 
     assert excinfo.value.raw_response == answer

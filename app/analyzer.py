@@ -117,7 +117,7 @@ def _validate_against_context(
         )
 
 
-def analyze(
+async def analyze(
     post: RawPost,
     candidates: list[PostRecord],
     allowed_topics: list[TopicRecord],
@@ -125,13 +125,15 @@ def analyze(
     """Run the single analysis call for one post and return its validated result.
 
     Returns the *raw, validated* ``duplicate_of_candidate_index``; it never maps that
-    index to a database id (Invariant 4).
+    index to a database id (Invariant 4). Awaitable since phase 6: the pipeline analyses
+    several approved posts concurrently, and each one waits on the model without holding
+    the event loop.
     """
     system_prompt = load_system_prompt()
     user_prompt = build_user_prompt(post, candidates, allowed_topics)
 
     logger.debug("Analyzing reddit_id=%s with %d candidate(s)", post.reddit_id, len(candidates))
-    raw_text = chat_completion(system_prompt, user_prompt)
+    raw_text = await chat_completion(system_prompt, user_prompt)
 
     data = _parse_json_object(raw_text)
     analysis = _validate_schema(data)

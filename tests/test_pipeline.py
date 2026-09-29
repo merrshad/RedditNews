@@ -32,6 +32,7 @@ from tests.conftest import (
     insert_source,
     insert_topic,
     patch_telegram,
+    run,
     temp_topic_key,
 )
 
@@ -40,6 +41,28 @@ TOPIC_NAME = "هوش مصنوعی"
 REVIEW_CHANNEL = "-100999"
 PUBLIC_CHANNEL = "-100123"
 ADMIN_ID = "777"
+# What Telegram reports as the deciding admin's name — the status button shows it (phase 6).
+ADMIN_NAME = "مدیر"
+
+
+# --- thin wrappers: the entry points are awaitable since phase 6 -------------------
+# The tests stay synchronous and call exactly what `main` calls, one `asyncio.run` deep.
+
+
+def _run_once() -> None:
+    run(pipeline.run_once())
+
+
+def _process_approved_posts() -> None:
+    run(pipeline.process_approved_posts())
+
+
+def _retry_pending_sends() -> None:
+    run(pipeline.retry_pending_sends())
+
+
+def _decide(callback_query: dict[str, Any]) -> bool:
+    return run(review.handle_callback(callback_query))
 
 VALID_ANSWER: dict[str, Any] = {
     "is_relevant": True,
@@ -125,8 +148,23 @@ def _harness(
     )
     monkeypatch.setattr("app.analyzer.chat_completion", llm)
     monkeypatch.setattr("app.pipeline.get_settings", lambda: settings)
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda *args, **kwargs: list(posts or []))
+    monkeypatch.setattr("app.pipeline.fetch_all", _fetched(posts or []))
     return llm, telegram
+
+
+def _fetched(posts: list[RawPost]):
+    """An async ``fetch_all`` stand-in returning exactly these posts."""
+
+    async def _fetch_all(*_args: Any, **_kwargs: Any) -> list[RawPost]:
+        return list(posts)
+
+    return _fetch_all
+
+
+def _last_buttons(telegram: FakeTelegram) -> list[str]:
+    """The labels of the last keyboard the review flow drew — the message it kept."""
+    markup = telegram.keyboard_edits[-1][0]
+    return [button["text"] for row in markup["inline_keyboard"] for button in row]
 
 
 def _row(connection: psycopg.Connection, reddit_id: str) -> dict[str, Any]:
@@ -140,7 +178,7 @@ def _approve(post_id: int, *, user_id: str = ADMIN_ID, callback_id: str = "cb-ap
     return {
         "id": callback_id,
         "data": f"approve:{post_id}",
-        "from": {"id": int(user_id)},
+        "from": {"id": int(user_id), "first_name": ADMIN_NAME},
         "message": {"message_id": 1, "chat": {"id": int(REVIEW_CHANNEL)}},
     }
 
@@ -149,7 +187,7 @@ def _reject(post_id: int, *, user_id: str = ADMIN_ID, callback_id: str = "cb-rej
     return {
         "id": callback_id,
         "data": f"reject:{post_id}",
-        "from": {"id": int(user_id)},
+        "from": {"id": int(user_id), "first_name": ADMIN_NAME},
         "message": {"message_id": 1, "chat": {"id": int(REVIEW_CHANNEL)}},
     }
 
@@ -239,7 +277,7 @@ def test_a_new_post_waits_for_the_admin_and_never_reaches_the_llm(
     """
     llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
 
-    pipeline.run_once()
+    _run_once()
 
     row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "awaiting_review"
@@ -272,7 +310,7 @@ def test_every_fetched_post_gets_its_own_review_message(
     posts = [_post(f"one"), _post("two"), _post("three")]
     _, telegram = _harness(monkeypatch, settings=settings, posts=posts)
 
-    pipeline.run_once()
+    _run_once()
 
     assert len(telegram.messages_to(REVIEW_CHANNEL)) == 3
     callbacks = {
@@ -297,11 +335,11 @@ def test_a_post_whose_review_message_fails_stays_new_and_is_retried(
     telegram.fail_next_sends = 1
     _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
 
-    pipeline.run_once()
+    _run_once()
 
     assert _row(taxonomy, _post().reddit_id)["status"] == "new"
 
-    pipeline.run_once()  # the post is still there, and Telegram works again
+    _run_once()  # the post is still there, and Telegram works again
 
     assert _row(taxonomy, _post().reddit_id)["status"] == "awaiting_review"
     assert len(telegram.messages_to(REVIEW_CHANNEL)) == 1
@@ -315,10 +353,10 @@ def test_a_known_post_is_not_stored_delivered_or_analysed_again(
     """Invariant 1: the same ``reddit_id`` in a second cycle changes nothing."""
     llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
 
-    pipeline.run_once()
+    _run_once()
     first = _row(taxonomy, _post().reddit_id)
 
-    pipeline.run_once()
+    _run_once()
 
     assert _row(taxonomy, _post().reddit_id) == first
     assert len(telegram.messages_to(REVIEW_CHANNEL)) == 1
@@ -333,14 +371,14 @@ def test_the_configured_fetch_limit_is_handed_to_the_collector(
     """NFR-7: how many posts a cycle may take is configuration, not a constant."""
     captured: list[tuple[Any, int]] = []
 
-    def _record(sources: Any, *, default_fetch_limit: int) -> list[RawPost]:
+    async def _record(sources: Any, *, default_fetch_limit: int) -> list[RawPost]:
         captured.append((sources, default_fetch_limit))
         return []
 
     llm, _ = _harness(monkeypatch, settings=settings)
     monkeypatch.setattr("app.pipeline.fetch_all", _record)
 
-    pipeline.run_once()
+    _run_once()
 
     assert captured, "the collector was not called"
     sources, limit = captured[0]
@@ -356,7 +394,7 @@ def test_an_empty_fetch_produces_no_messages_and_no_llm_calls(
 ) -> None:
     llm, telegram = _harness(monkeypatch, settings=settings, posts=[])
 
-    pipeline.run_once()
+    _run_once()
 
     assert llm.calls == [] and telegram.sent == []
     assert taxonomy.execute(
@@ -375,20 +413,25 @@ def test_approving_a_post_analyses_and_publishes_it_once(
 ) -> None:
     """The happy path end to end: ✅ -> one LLM call -> one public message."""
     llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
-    pipeline.run_once()
+    _run_once()
     post_id = _row(taxonomy, _post().reddit_id)["id"]
 
-    assert review.handle_callback(_approve(post_id)) is True
+    assert _decide(_approve(post_id)) is True
 
     approved = _row(taxonomy, _post().reddit_id)
     assert approved["status"] == "approved" and approved["review_status"] == "approved"
     assert approved["reviewed_by"] == ADMIN_ID and approved["reviewed_at"] is not None
     assert approved["approved_at"] is not None and approved["rejected_at"] is None
-    assert telegram.edits[-1][0] == review.PROCESSING_TEXT
+    assert approved["reviewed_by_name"] == ADMIN_NAME
+    # Phase 6: the post itself stays, and the ✅/❌ pair becomes a status naming the admin.
+    assert _last_buttons(telegram) == [
+        f"✅ تأیید شد — {ADMIN_NAME}",
+        review.PROCESSING_BUTTON_TEXT,
+    ]
     assert llm.calls == []  # deciding a post is not analysing it
 
     # What `main` does right after a decision: no RSS fetch, just the approved queue.
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     published = _row(taxonomy, _post().reddit_id)
     assert published["status"] == "sent"
@@ -403,11 +446,14 @@ def test_approving_a_post_analyses_and_publishes_it_once(
     public = telegram.messages_to(PUBLIC_CHANNEL)
     assert len(public) == 1
     assert VALID_ANSWER["summary_fa"] in public[0] and "نکته اول" in public[0]
-    # The review message stays as the audit trail, its buttons replaced by the outcome.
-    assert telegram.edits[-1][0] == review.PUBLISHED_TEXT
+    # The review message stays as the audit trail; only its buttons report the outcome.
+    assert _last_buttons(telegram) == [
+        f"✅ تأیید شد — {ADMIN_NAME}",
+        review.PUBLISHED_BUTTON_TEXT,
+    ]
 
     # Invariant 12: a second pass over the same post publishes nothing again.
-    pipeline.run_once()
+    _run_once()
 
     assert len(telegram.messages_to(PUBLIC_CHANNEL)) == 1
     assert len(llm.calls) == 1
@@ -421,18 +467,19 @@ def test_rejecting_a_post_stops_the_flow_before_the_llm(
 ) -> None:
     """FR-13: ❌ is terminal — no LLM, no translation, no summary, no publication."""
     llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
-    pipeline.run_once()
+    _run_once()
     post_id = _row(taxonomy, _post().reddit_id)["id"]
 
-    assert review.handle_callback(_reject(post_id)) is True
+    assert _decide(_reject(post_id)) is True
 
     rejected = _row(taxonomy, _post().reddit_id)
     assert rejected["status"] == "rejected" and rejected["review_status"] == "rejected"
     assert rejected["rejected_at"] is not None and rejected["reviewed_by"] == ADMIN_ID
     assert rejected["summary_fa"] is None and rejected["ai_processed_at"] is None
-    assert telegram.edits[-1][0] == review.REJECTED_TEXT
+    assert rejected["reviewed_by_name"] == ADMIN_NAME
+    assert _last_buttons(telegram) == [f"❌ تأیید نشد — {ADMIN_NAME}"]
 
-    pipeline.run_once()
+    _run_once()
 
     assert llm.calls == []  # never analysed, not even in a later cycle
     assert telegram.messages_to(PUBLIC_CHANNEL) == []
@@ -447,12 +494,12 @@ def test_the_first_of_two_simultaneous_decisions_wins(
     """Invariant 12: ``PENDING -> APPROVED`` succeeds exactly once."""
     telegram = FakeTelegram()
     _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
-    pipeline.run_once()
+    _run_once()
     post_id = _row(taxonomy, _post().reddit_id)["id"]
 
-    assert review.handle_callback(_approve(post_id, callback_id="first")) is True
+    assert _decide(_approve(post_id, callback_id="first")) is True
     # The second admin presses the same, now stale, button.
-    assert review.handle_callback(_reject(post_id, user_id="888", callback_id="second")) is False
+    assert _decide(_reject(post_id, user_id="888", callback_id="second")) is False
 
     row = _row(taxonomy, _post().reddit_id)
     assert row["review_status"] == "approved" and row["reviewed_by"] == ADMIN_ID
@@ -460,7 +507,7 @@ def test_the_first_of_two_simultaneous_decisions_wins(
     assert row["status"] == "approved"  # the losing click changed nothing
     assert telegram.answers[-1] == ("second", review.ALREADY_REVIEWED_TEXT)
     # The loser must not rewrite the message the winner already updated.
-    assert telegram.edits[-1][0] == review.PROCESSING_TEXT
+    assert _last_buttons(telegram)[0] == f"✅ تأیید شد — {ADMIN_NAME}"
 
 
 def test_only_listed_admins_may_decide(
@@ -471,16 +518,16 @@ def test_only_listed_admins_may_decide(
     """FR-12: the allow-list is the authorisation; nobody else can approve."""
     telegram = FakeTelegram()
     _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
-    pipeline.run_once()
+    _run_once()
     post_id = _row(taxonomy, _post().reddit_id)["id"]
 
-    assert review.handle_callback(_approve(post_id, user_id="999")) is False
+    assert _decide(_approve(post_id, user_id="999")) is False
 
     row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "awaiting_review" and row["review_status"] == "pending_review"
     assert row["reviewed_by"] is None
     assert telegram.answers[-1] == ("cb-approve", review.NOT_ADMIN_TEXT)
-    assert telegram.edits == []
+    assert telegram.keyboard_edits == []
 
 
 def test_a_duplicate_is_recorded_against_the_real_id_of_the_second_candidate(
@@ -498,21 +545,21 @@ def test_a_duplicate_is_recorded_against_the_real_id_of_the_second_candidate(
         posts=[_post()],
         llm=FakeChatCompletion(_answer(duplicate_of_candidate_index=2)),
     )
-    pipeline.run_once()
-    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+    _run_once()
+    _decide(_approve(_row(taxonomy, _post().reddit_id)["id"]))
 
     # What the LLM was shown: newest first, so position 2 is the older candidate.
     listed = repository.fetch_recent_candidates(50, 72)
     assert [candidate.id for candidate in listed] == [newer, older]
 
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "skipped_duplicate"
     assert row["duplicate_of_id"] == listed[1].id  # a real row id, not the index 2
     assert row["duplicate_of_id"] != 2
     assert telegram.messages_to(PUBLIC_CHANNEL) == []
-    assert telegram.edits[-1][0].startswith("✅ تأیید شد\n⛔️ منتشر نشد")
+    assert any("⛔️ منتشر نشد" in label for label in _last_buttons(telegram))
     assert len(llm.calls) == 1
 
 
@@ -529,10 +576,10 @@ def test_a_low_importance_post_is_not_published_even_after_approval(
         posts=[_post()],
         llm=FakeChatCompletion(_answer(importance="low")),
     )
-    pipeline.run_once()
-    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+    _run_once()
+    _decide(_approve(_row(taxonomy, _post().reddit_id)["id"]))
 
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "skipped_low_importance"
@@ -550,7 +597,7 @@ def test_an_invalid_llm_answer_fails_only_that_post(
     bad = _post("bad", title="پست با پاسخ بد")
     good = _post("good", title="پست سالم")
 
-    def _completion(system_prompt: str, user_prompt: str) -> str:
+    async def _completion(system_prompt: str, user_prompt: str) -> str:
         # The prompt carries the title (never the reddit_id — Invariant 4).
         return "{not json at all" if bad.title in user_prompt else _answer()
 
@@ -560,15 +607,15 @@ def test_an_invalid_llm_answer_fails_only_that_post(
     )
     monkeypatch.setattr("app.analyzer.chat_completion", _completion)
     monkeypatch.setattr("app.pipeline.get_settings", lambda: settings)
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda *a, **k: [bad, good])
+    monkeypatch.setattr("app.pipeline.fetch_all", _fetched([bad, good]))
 
     # Both posts are fetched (the LLM is never called while storing) ...
-    pipeline.run_once()
+    _run_once()
     assert llm.calls == []
     for post in (bad, good):
-        assert review.handle_callback(_approve(_row(taxonomy, post.reddit_id)["id"])) is True
+        assert _decide(_approve(_row(taxonomy, post.reddit_id)["id"])) is True
 
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     failed = _row(taxonomy, bad.reddit_id)
     assert failed["status"] == "failed"
@@ -592,11 +639,11 @@ def test_a_rejected_publication_is_retried_without_re_analysing(
     """FR-11: the row is durable, so a failed send is finished by the next run."""
     telegram = FakeTelegram()
     llm, _ = _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
-    pipeline.run_once()
-    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+    _run_once()
+    _decide(_approve(_row(taxonomy, _post().reddit_id)["id"]))
 
     telegram.fail_next_sends = 1  # the send to the public channel is refused
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     after_failure = _row(taxonomy, _post().reddit_id)
     assert after_failure["status"] == "to_send"  # the claim was handed back
@@ -604,7 +651,7 @@ def test_a_rejected_publication_is_retried_without_re_analysing(
     assert after_failure["summary_fa"] is not None  # analysed once, and kept
     assert len(llm.calls) == 1
 
-    pipeline.retry_pending_sends()  # what the next cycle starts with
+    _retry_pending_sends()  # what the next cycle starts with
 
     recovered = _row(taxonomy, _post().reddit_id)
     assert recovered["status"] == "sent"
@@ -629,8 +676,8 @@ def test_the_lookback_limit_is_the_one_handed_to_the_repository(
     _harness(monkeypatch, settings=bounded, posts=[_post()])
     monkeypatch.setattr("app.pipeline.repository.fetch_recent_candidates", _record)
 
-    pipeline.run_once()
-    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
-    pipeline.process_approved_posts()
+    _run_once()
+    _decide(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+    _process_approved_posts()
 
     assert seen == [(7, bounded.similarity_lookback_hours)]
