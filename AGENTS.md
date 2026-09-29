@@ -194,7 +194,7 @@
 | NFR-4 | امنیت | تمام رازها (کلید LLM، توکن تلگرام، اعتبارنامه دیتابیس) فقط از env خوانده می‌شوند؛ هرگز در کد، لاگ یا این مستندات هاردکد/چاپ نمی‌شوند. |
 | NFR-5 | قابل‌نگهداری (Maintainability) | جداسازی مسئولیت‌ها طبق ساختار پروژه (بخش ۹)؛ این مستند همیشه با کد هم‌راستا نگه داشته می‌شود (بخش ۱۴). |
 | NFR-6 | کارایی/هزینه | یک تماس LLM به‌ازای هر پست جدید؛ پردازش ترتیبی (نه موازی) چون حجم MVP کم است و از API رایگان با rate limit استفاده می‌شود. |
-| NFR-7 | قابل‌پیکربندی بودن | افزودن ساب‌ردیت/موضوع جدید، تغییر فاصله زمانی polling، یا تغییر آستانه ارسال، بدون تغییر کد و فقط با ویرایش config/env ممکن است. |
+| NFR-7 | قابل‌پیکربندی بودن | افزودن ساب‌ردیت/موضوع جدید (با دستورهای تلگرامی ادمین — FR-14)، تغییر فاصله زمانی polling، یا تغییر آستانه ارسال، بدون تغییر کد ممکن است. |
 | NFR-8 | قابلیت تست | فراخوانی‌های I/O (RSS، LLM، Telegram، DB) پشت رابط‌های نازک قرار می‌گیرند تا در تست واحد به‌سادگی mock شوند؛ منطق parsing/formatting به‌صورت تابع خالص نوشته می‌شود. |
 
 ---
@@ -254,11 +254,11 @@ reddit-telegram-digest/
 │   └── schema.sql            # تنها منبع تغییر schema + seed فهرست اولیه موضوعات/منابع (بخش ۱۰)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # نقطه ورود: long-poll تصمیم‌های تلگرام + حلقه دوره‌ای `pipeline.run_once()` و خروج تمیز روی SIGTERM (NFR-2/NFR-3)
+│   ├── main.py                # نقطه ورود: preflight اسکیما، long-poll تصمیم‌های تلگرام، حلقه دوره‌ای `pipeline.run_once()` و خروج تمیز روی SIGTERM (NFR-2/NFR-3)
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
 │   ├── models.py              # مدل‌های Pydantic: RawPost, TopicRecord, SourceRecord, LlmAnalysis, PostRecord
 │   ├── reddit_source.py       # واکشی/parse RSS با سقف هر منبع؛ API: fetch_all, topic_display_names → FR-1
-│   ├── repository.py          # تمام پرس‌وجوهای DB (موضوعات، منابع، پست‌ها و گذارهای اتمیک)؛ API: list_topics, list_sources, exists, save, fetch_new_reviews, mark_review_dispatched, decide_review, fetch_approved_for_analysis, record_analysis, fetch_pending_to_send, claim_for_publish, mark_published, fetch_recent_candidates → FR-2..FR-15
+│   ├── repository.py          # تمام پرس‌وجوهای DB (موضوعات، منابع، پست‌ها و گذارهای اتمیک)؛ API: list_topics, list_sources, exists, save, fetch_new_reviews, mark_review_dispatched, decide_review, fetch_approved_for_analysis, record_analysis, fetch_pending_to_send, claim_for_publish, mark_published, fetch_recent_candidates, find_unusable_tables → FR-2..FR-15
 │   ├── llm_client.py          # تنها تماس خام LLM: chat_completion() روی SDK OpenAI-compatible + retry
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
@@ -266,9 +266,10 @@ reddit-telegram-digest/
 │   ├── telegram_notifier.py   # مرز کل Bot API با httpx؛ API: send_message, edit_message_text, answer_callback_query, get_updates → FR-10، FR-12
 │   ├── review.py              # گیت انسانی: تحویل به کانال خصوصی، تصمیم ✅/❌، چرخهٔ متن پیام ریویو؛ API: dispatch_pending_reviews, handle_callback → FR-12
 │   ├── telegram_updates.py    # دریافت و مسیریابی updateهای تلگرام (cursor + long-poll)؛ API: poll_once → FR-12
+│   ├── admin.py               # پنل ادمین روی تلگرام: دستورهای /topics و /sources برای مدیریت موضوعات و منابع؛ API: handle_command → FR-14
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)؛ API: format_message(post, topic_name=...) → FR-10
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن + `PermanentError` (DRY، NFR-2)
-│   └── pipeline.py            # orchestration؛ API: run_once, process_approved_posts, retry_pending_sends → FR-1..FR-13
+│   └── pipeline.py            # orchestration؛ API: run_once, process_approved_posts, retry_pending_sends → FR-1..FR-15
 └── tests/
     ├── conftest.py             # fixtureهای مشترک (تلگرام جعلی، کانکشن واقعی، ساخت موضوع/منبع تست) + دیتابیس اختصاصی تست
     ├── fixtures/
@@ -280,19 +281,20 @@ reddit-telegram-digest/
     ├── test_telegram_notifier.py
     ├── test_llm_client.py
     ├── test_retry.py
+    ├── test_admin.py
     ├── test_main.py
     ├── test_pipeline.py
     ├── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴ و ۵)
     └── test_docs_consistency.py       # Invariant 11: تطبیق همین سند با کد واقعی (بخش ۱۴)
 ```
 
-هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، گیت انسانی (`review` + `telegram_updates`)، مرز تلگرام (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
+هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، گیت انسانی (`review` + `telegram_updates`)، مدیریت (`admin`)، مرز تلگرام (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
 
 تست‌های دیتابیسی روی یک دیتابیس **جداگانه** (`<DATABASE_URL>_test`) اجرا می‌شوند که `conftest.py` خودش می‌سازد؛ `apply_schema()` جدول‌های آن را از صفر می‌سازد (چون `CREATE TABLE IF NOT EXISTS` ستون تازه به جدول موجود اضافه نمی‌کند) و `db/schema.sql` تنها منبع ساختار است — تا یک اجرای واقعی `docker compose up` که رکورد در دیتابیس توسعه می‌نویسد، نتیجهٔ تست‌ها را عوض نکند.
 
 `repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هیچ پیکربندی نمی‌خواند: ردیف‌های `sources` را از `repository` می‌گیرد، پس `settings.py` فقط env را می‌شناسد.
 
-`telegram_notifier.py` هم بدون حالت است: چند تابع ماژول‌سطح (نه کلاس) توکن را خودشان از `settings` می‌خوانند، هر تماس HTTP را با `retryable` می‌پوشانند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار گزارش می‌کنند (`send_message` → `message_id` یا `None`، `get_updates` → لیست خالی) — تا `pipeline`/`review` تصمیم بگیرند و هیچ خطایی حلقهٔ worker را نکشد. `review.py` تنها جای تصمیم‌گیری انسانی است (تحویل به کانال خصوصی، اعتبارسنجی ادمین، گذار اتمیک، ویرایش متن پیام) و `telegram_updates.py` تنها جای خواندن update. `main.py` هیچ نوتیفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: `run_once()`، `process_approved_posts()` و `retry_pending_sends()` تنظیمات و موضوعات خودشان را می‌خوانند. تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
+`telegram_notifier.py` هم بدون حالت است: چند تابع ماژول‌سطح (نه کلاس) توکن را خودشان از `settings` می‌خوانند، هر تماس HTTP را با `retryable` می‌پوشانند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار گزارش می‌کنند (`send_message` → `message_id` یا `None`، `get_updates` → لیست خالی) — تا `pipeline`/`review` تصمیم بگیرند و هیچ خطایی حلقهٔ worker را نکشد. `review.py` تنها جای تصمیم‌گیری انسانی است (تحویل به کانال خصوصی، اعتبارسنجی ادمین، گذار اتمیک، ویرایش متن پیام) و `telegram_updates.py` تنها جای خواندن update. `admin.py` (پنل ادمین) هم بدون حالت است: هر دستور یک خط، هر دستور یک پاسخ فارسی، و هیچ conversation state یا منویی نگه نمی‌دارد؛ فقط برای idهای داخل `TELEGRAM_ADMIN_IDS` پاسخ می‌دهد. `main.py` هیچ نوتیفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: `run_once()`، `process_approved_posts()` و `retry_pending_sends()` تنظیمات و موضوعات خودشان را می‌خوانند. تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
 
 ---
 
@@ -515,7 +517,7 @@ r/{subreddit} • {topic} • اهمیت: {importance_fa}
 ```
 
 - `importance_fa`: `low`→«کم»، `medium`→«متوسط»، `high`→«بالا»؛ مقدار نامعتبر یا `None`→«نامشخص».
-- `{topic}` نام فارسی موضوع از `config/topics.yaml` است؛ اگر در دسترس نباشد، همان کلید موضوع نمایش داده می‌شود (نه یک رشته انگلیسی خام).
+- `{topic}` نام فارسی موضوع از جدول `topics` می‌آید (کلید `topic` تحلیل، یا در نبود آن `source_topic_key`)؛ اگر در دسترس نباشد، همان کلید موضوع نمایش داده می‌شود (نه یک رشته انگلیسی خام).
 - اگر `key_points` خالی/`None` باشد، بخش «نکات کلیدی» کلاً حذف می‌شود.
 - `format_message` تضمین می‌کند کل پیام از حد تلگرام (۴۰۹۶ کاراکتر) رد نشود؛ در صورت نیاز ابتدا `summary_fa` با «…» کوتاه می‌شود.
 
@@ -546,9 +548,20 @@ docker compose up --build
 - `worker`: همان ایمیج پایتون (`Dockerfile`)، `env_file: .env`، و `depends_on` با شرط
   `service_healthy` تا هیچ دوری قبل از آماده بودن دیتابیس شروع نشود.
 
-نکتهٔ عملیاتی: `db/schema.sql` فقط زمانی خودکار اعمال می‌شود که volume دیتابیس خالی باشد؛
-اگر بعداً schema تغییر کرد، یا آن را دستی روی دیتابیس اجرا کنید یا `docker compose down -v`
-را آگاهانه بزنید (Invariant 9: هیچ تغییر schema بیرون از `db/schema.sql` مجاز نیست).
+نکتهٔ عملیاتی: `db/schema.sql` فقط زمانی خودکار اعمال می‌شود که volume دیتابیس خالی باشد
+(Invariant 9: هیچ تغییر schema بیرون از `db/schema.sql` مجاز نیست). برای دیتابیسی که از فاز
+قبلی مانده، اجرای دستی فایل کافی **نیست** چون `CREATE TABLE IF NOT EXISTS` جدول موجود با
+ستون‌های قدیمی را دست نمی‌زند؛ راه درست ساختن volume تازه است:
+
+```bash
+docker compose down -v && docker compose up -d --build
+```
+
+برای اینکه این اشتباه ساکت نماند، `main.preflight()` در استارتاپ سه جدول `topics`/`sources`/
+`posts` را با همان لیست ستون‌های خواندهٔ واقعی تست می‌کند و در صورت ناسازگاری با یک پیام صریح
+(شامل همین دستور) خارج می‌شود. اندازه‌گیری واقعی روی volume همان فاز ۴: قبلاً هر دور با
+`UndefinedTable: relation "topics" does not exist` می‌مرد و `worker` سالم به‌نظر می‌رسید ولی
+هیچ کاری نمی‌کرد؛ حالا استارتاپ با یک خط قابل‌اقدام می‌شکند (NFR-3).
 
 ### اجرای تست‌ها
 ```bash
@@ -643,3 +656,8 @@ pytest
   5. **Schema پست‌ها گسترش یافت** (بخش ۱۰): `review_status` جدا از `status` (تصمیم انسانی در مقابل وضعیت ماشین)، سابقهٔ کامل تصمیم (`reviewed_by`/`reviewed_at`/`approved_at`/`rejected_at`)، شناسهٔ پیام‌های دو کانال، `ai_processed_at`/`ai_error`، و وضعیت‌های تازه `awaiting_review`/`approved`/`rejected`/`publishing`. هم‌چنین `published_at` از «زمان انتشار پست در ریدیت» به «زمان انتشار ما در کانال عمومی» تغییر معنا داد و آن یکی به `posted_at` تغییر نام داد؛ `sent_at` هم با `published_at` جایگزین شد تا دو ستون هم‌معنا نداشته باشیم.
   6. **تفکیک دیتابیس تست جایزهٔ خودش را داد**: چون جریان ریویو در SQL شرطی است، تست‌های pipeline از repository درون‌حافظه‌ای به Postgres واقعی منتقل شدند و `apply_schema()` جدول‌های دیتابیس تست را از صفر می‌سازد (اگر دیتابیس تستی از فاز قبل می‌ماند، ساکت شکست می‌خورد — یک باگ واقعی که همان لحظه دیده شد).
   7. **یک باگ واقعی که همین تست‌ها گرفتند**: `PostRecord` روی ردیفی که `key_points` آن `NULL` است (پست تازه‌ذخیره‌شده قبل از تحلیل) شکست می‌خورد؛ حالا `NULL` به لیست خالی تبدیل می‌شود.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — پنل ادمین در تلگرام)** — موضوعات و منابع در دیتابیس بودند ولی راه تغییرشان وجود نداشت، و «پنل مدیریت» در بخش ۲ خارج از دامنه بود؛ این پوشش با یک ماژول تازه و یک تصمیم شکل‌دهنده بسته شد:
+  1. **`app/admin.py` — پنل همان ربات است** (FR-14): دوازده دستور تک‌خطی (`/help`، `/topics`، `/addtopic`، `/renametopic`، `/toggletopic`، `/deltopic`، `/sources`، `/addsource`، `/setsourcetopic`، `/setsourcelimit`، `/togglesource`، `/delsource`) بدون conversation state، بدون منو و بدون دکمه. دلیل: `KISS` و YAGNI؛ هر دستور ورودی خودش را کامل در همان خط می‌گیرد، پس هیچ حالت بین دو پیام نگه‌داری نمی‌شود و ماژول کاملاً بدون state است.
+  2. **روتینگ update در `telegram_updates.route`**: `callback_query` همچنان به `review` می‌رود و `message` تازه به `admin` می‌رود، پس تنها جای read کردن `update_id` همان یک ماژول باقی می‌ماند و `ALLOWED_UPDATES` هم `message` را اضافه کرده است.
+  3. **آزادسازی موضوع، سابقه را نمی‌خورد**: `posts.source_topic_key` عمداً FK به `topics` نیست، پس `/deltopic` موضوع و منابعش را حذف می‌کند ولی پست‌های ذخیره‌شده و سابقهٔ ریویو (با کلید متنی قدیمی) سالم می‌مانند — همین رفتار در پاسخ دستور هم به ادمین گفته می‌شود.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — preflight اسکیما)** — یک باگ واقعی که فقط با اجرای روی محیط واقعی دیده شد: volume دیتابیس از فاز ۴ مانده بود و `db/schema.sql` هم به‌خاطر `CREATE TABLE IF NOT EXISTS` جدول `posts` را با ستون‌های قدیمی رها می‌کرد؛ نتیجه این بود که هر دور با `UndefinedTable` می‌مرد، `_run_safely` آن را در لاگ فرو می‌برد و `worker` سالم به‌نظر می‌رسید ولی هیچ‌کاری نمی‌کرد. دو راه‌حل کمینه: `main.preflight()` در استارتاپ سه جدول را با همان لیست ستون‌های خواندهٔ واقعی تست می‌کند و با پیام قابل‌اقدام (شامل دستور `down -v`) خارج می‌شود، و بخش ۱۳ همین نکته را برای دیتابیس‌های باقی‌مانده باز می‌کند. `find_unusable_tables()` به‌جای «فقط وجود جدول»، خودِ کوئری‌های واقعی را با `LIMIT 0` اجرا می‌کند، پس هم جدول غایب و هم جدول با ستون‌های قدیمی را می‌گیرد.

@@ -158,6 +158,7 @@ def test_the_config_directory_is_gone() -> None:
         (repository, "claim_for_publish"),
         (repository, "mark_published"),
         (repository, "fetch_recent_candidates"),
+        (repository, "find_unusable_tables"),
         (analyzer, "analyze"),
         (telegram_notifier, "send_message"),
         (telegram_notifier, "edit_message_text"),

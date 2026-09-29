@@ -313,6 +313,38 @@ def delete_source(rss_url: str) -> bool:
 # --- posts --------------------------------------------------------------------------
 
 
+# The three queries this code cannot run without, each using the same column list as the
+# real reads. A database created by an earlier phase has the wrong shape here, and
+# `docker compose up` cannot fix it: `db/schema.sql` only runs on a *first* boot
+# (Invariant 9 — there are no migrations). Hence the startup preflight below.
+_SCHEMA_PROBES: tuple[tuple[str, str], ...] = (
+    ("topics", f"SELECT {_TOPIC_COLUMNS} FROM topics LIMIT 0"),
+    ("sources", f"SELECT {_SOURCE_COLUMNS} FROM sources s JOIN topics t ON t.id = s.topic_id LIMIT 0"),
+    ("posts", f"SELECT {_POST_COLUMNS} FROM posts LIMIT 0"),
+)
+
+
+def find_unusable_tables() -> list[str]:
+    """Tables this code cannot query with its own column lists (empty list = ready).
+
+    Catches both a table that does not exist and one left over from an earlier phase (right
+    name, wrong columns) — which is exactly what a Docker volume from a previous phase looks
+    like. Being schema-aware here is what turns a worker that silently logs
+    ``UndefinedTable`` every cycle into one clear startup error (Invariant 9, NFR-3).
+    """
+    problems: list[str] = []
+    with _connection() as connection:
+        for name, probe in _SCHEMA_PROBES:
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(probe)
+                    cursor.fetchall()
+            except psycopg.Error:
+                # Autocommit: the failed probe is its own transaction, so the next one runs.
+                problems.append(name)
+    return problems
+
+
 def exists(reddit_id: str) -> bool:
     """FR-2 — cheap exact duplicate check before storing anything."""
     with _connection() as connection, connection.cursor() as cursor:

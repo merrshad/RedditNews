@@ -14,9 +14,12 @@ from typing import Any
 
 import pytest
 
-from app import main
+from urllib.parse import urlsplit, urlunsplit
+
+from app import main, repository
 from app.settings import Settings
 from app.telegram_updates import PollResult
+from tests.conftest import TEST_DATABASE_URL
 
 
 class _Clock:
@@ -51,6 +54,8 @@ def _quiet(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
     monkeypatch.setattr("app.main.get_settings", lambda: settings)
     monkeypatch.setattr("app.main.setup_logging", lambda level: None)
     monkeypatch.setattr("app.main._install_signal_handlers", lambda: None)
+    # The loop tests are not about the database, and the preflight has its own tests below.
+    monkeypatch.setattr("app.main.preflight", lambda: None)
 
 
 def test_main_keeps_cycling_after_a_failed_run_and_stops_on_shutdown(
@@ -137,6 +142,76 @@ def test_the_signal_handler_takes_the_same_path_as_ctrl_c() -> None:
     """``docker stop`` (SIGTERM) must interrupt the poll and exit cleanly."""
     with pytest.raises(KeyboardInterrupt):
         main._request_shutdown(signal.SIGTERM, None)
+
+
+def _point_repository_at(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """Make ``repository`` (which reads its own settings) talk to a specific database."""
+    stale = Settings(
+        database_url=url,
+        openai_api_key="test-key",
+        openai_base_url="https://llm.example/v1",
+        openai_model="test-model",
+        telegram_bot_token="000000:test-token",
+        telegram_chat_id="-100123",
+        telegram_review_channel_id="-100999",
+        telegram_admin_ids="777",
+        poll_interval_seconds=1,
+        rss_fetch_limit=25,
+        similarity_lookback_limit=50,
+        similarity_lookback_hours=72,
+        min_importance_to_send="low",
+        http_max_retries=2,
+        log_level="INFO",
+    )
+    monkeypatch.setattr("app.repository.get_settings", lambda: stale)
+
+
+def test_preflight_accepts_the_database_built_from_schema_sql(
+    postgres_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real test database *is* ``db/schema.sql``, so the preflight must pass on it."""
+    _point_repository_at(monkeypatch, postgres_database)
+
+    assert repository.find_unusable_tables() == []
+    assert main.preflight() is None
+
+
+def test_preflight_rejects_a_database_left_over_from_an_earlier_phase(
+    postgres_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observed for real: a Docker volume from phase 4 makes every cycle die with
+    ``UndefinedTable`` while the worker still looks alive. The preflight must turn that
+    into one actionable startup error instead (Invariant 9, NFR-3).
+
+    The maintenance database of the same server stands in for such a volume: it exists and
+    has none of the app tables.
+    """
+    parts = urlsplit(postgres_database)
+    _point_repository_at(monkeypatch, urlunsplit(parts._replace(path="/postgres")))
+
+    assert set(repository.find_unusable_tables()) == {"topics", "sources", "posts"}
+    with pytest.raises(SystemExit) as excinfo:
+        main.preflight()
+    message = str(excinfo.value)
+    assert "topics" in message and "down -v" in message
+
+
+def test_main_refuses_to_start_instead_of_looping_on_a_broken_schema(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    cycles: list[str] = []
+    _quiet(monkeypatch, settings)
+    monkeypatch.setattr("app.main.preflight", _raise_schema_error)
+    monkeypatch.setattr("app.pipeline.run_once", lambda: cycles.append("cycle"))
+
+    with pytest.raises(SystemExit):
+        main.main()
+
+    assert cycles == []
+
+
+def _raise_schema_error() -> None:
+    raise SystemExit("database schema is not ready")
 
 
 def test_setup_logging_keeps_the_secret_bearing_transport_loggers_quiet() -> None:

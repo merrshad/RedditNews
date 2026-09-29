@@ -15,15 +15,19 @@ from __future__ import annotations
 import logging
 from typing import Any, NamedTuple
 
-from app import review
-from app.telegram_notifier import INLINE_BUTTON_CALLBACK, LONG_POLL_SECONDS, get_updates
+from app import admin, review
+from app.telegram_notifier import (
+    INLINE_BUTTON_CALLBACK,
+    LONG_POLL_SECONDS,
+    PLAIN_MESSAGE,
+    get_updates,
+)
 
 logger = logging.getLogger(__name__)
 
-# Update kinds the worker listens to: button presses, i.e. the review decisions.
-# Admin commands are plain `message` updates and are switched on in a later step of
-# this phase.
-ALLOWED_UPDATES: tuple[str, ...] = (INLINE_BUTTON_CALLBACK,)
+# Update kinds the worker listens to: button presses (the review decisions) and plain
+# messages (the admin panel, app/admin.py).
+ALLOWED_UPDATES: tuple[str, ...] = (INLINE_BUTTON_CALLBACK, PLAIN_MESSAGE)
 
 
 class PollResult(NamedTuple):
@@ -66,5 +70,12 @@ def route(update: dict[str, Any]) -> bool:
     """Hand one update to the module that owns it; anything unknown is ignored."""
     callback_query = update.get("callback_query")
     if isinstance(callback_query, dict):
+        # A button press: the review decision and its message update.
         return review.handle_callback(callback_query)
+
+    message = update.get("message")
+    if isinstance(message, dict):
+        # A chat message: the admin command surface.
+        return admin.handle_command(message)
+
     return False

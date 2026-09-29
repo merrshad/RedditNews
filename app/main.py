@@ -20,7 +20,9 @@ import sys
 import time
 from collections.abc import Callable
 
-from app import pipeline, telegram_updates
+import psycopg
+
+from app import pipeline, repository, telegram_updates
 from app.settings import get_settings
 from app.telegram_notifier import LONG_POLL_SECONDS
 
@@ -102,10 +104,32 @@ def run_forever() -> None:
             time.sleep(MIN_POLL_INTERVAL_SECONDS - elapsed)
 
 
+def preflight() -> None:
+    """Fail fast (and loudly) when the database cannot serve this code (Invariant 9).
+
+    `db/schema.sql` is applied by the `db` container only on a *first* boot, so a volume from
+    an earlier phase keeps the old shape and every cycle would die with ``UndefinedTable``
+    while the worker still looked alive. Exiting with the fix in the message turns that
+    silent loop into one actionable line (NFR-3).
+    """
+    try:
+        unusable = repository.find_unusable_tables()
+    except psycopg.OperationalError as exc:
+        raise SystemExit(f"cannot reach the database ({exc}); is the `db` service up?") from exc
+
+    if unusable:
+        raise SystemExit(
+            f"database schema is not ready: {', '.join(unusable)} cannot be queried. "
+            "There are no migrations (the schema is applied once, on a fresh database), so "
+            "recreate the volume: `docker compose down -v && docker compose up -d --build`"
+        )
+
+
 def main() -> None:
     """Log, then poll and cycle forever; the pipeline reads its own settings."""
     settings = get_settings()
     setup_logging(settings.log_level)
+    preflight()
     _install_signal_handlers()
     logger.info(
         "Starting reddit-telegram-digest: model=%s, interval=%ds, review_channel=%s",
