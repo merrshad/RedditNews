@@ -17,6 +17,7 @@ URL, so failures are described with a sanitised message instead of httpx's own t
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -38,6 +39,13 @@ LONG_POLL_HTTP_TIMEOUT_SECONDS = 35.0
 # Telegram answers 429 when it throttles us (worth waiting for) and 400/401/403 when the
 # request itself is wrong (bad token, unknown chat, malformed HTML — never worth it).
 RATE_LIMIT_STATUS = 429
+
+# A 429 carries how long to wait (`parameters.retry_after`, and usually the `Retry-After`
+# header). Honouring it is what makes a burst of review messages actually land: a real run
+# pushing 25 messages to one channel got `retry after 30`, and the plain 1s/2s backoff
+# could not cover that, so 3 posts were left for the next cycle. Capped for the same reason
+# as the RSS side — one throttled call must not stall a whole cycle for minutes (NFR-2).
+MAX_RETRY_AFTER_SECONDS = 30.0
 
 # Telegram's hard limit for a single message. Truncating is formatting.py's job
 # (FR-10), so this module only reports the anomaly (see :func:`send_message`).
@@ -71,6 +79,24 @@ def _describe_call(*_args: Any, **_kwargs: Any) -> str:
     return f"telegram {method}"
 
 
+def _retry_after_seconds(response: httpx.Response, body: dict[str, Any]) -> float:
+    """How long Telegram asked us to wait, capped at ``MAX_RETRY_AFTER_SECONDS``.
+
+    The value normally arrives in the JSON body (``parameters.retry_after``) and often in the
+    ``Retry-After`` header too; absent or unparsable means ``0.0``, i.e. the normal
+    exponential backoff applies.
+    """
+    parameters = body.get("parameters")
+    raw: Any = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    if raw is None:
+        raw = getattr(response, "headers", {}).get("Retry-After")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
+
+
 @retryable(description=_describe_call)
 def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) -> Any:
     """One Bot API call; raises :class:`TelegramError` on any failure.
@@ -102,6 +128,15 @@ def _call_once(method: str, payload: dict[str, Any], *, timeout_seconds: float) 
         message = f"{method} rejected (HTTP {response.status_code}, description: {description})"
         if 400 <= response.status_code < 500 and response.status_code != RATE_LIMIT_STATUS:
             raise TelegramPermanentError(message)
+        if response.status_code == RATE_LIMIT_STATUS:
+            delay = _retry_after_seconds(response, body)
+            if delay:
+                logger.warning(
+                    "Telegram is throttling %s; waiting %.0fs before trying again",
+                    method,
+                    delay,
+                )
+                time.sleep(delay)
         raise TelegramError(message)
 
     return body.get("result")

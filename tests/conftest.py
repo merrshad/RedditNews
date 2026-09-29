@@ -294,12 +294,37 @@ def temp_source_url(path: str) -> str:
     return f"{TEST_SOURCE_URL_PREFIX}{path}"
 
 
+def prepare_test_database() -> None:
+    """Create ``<DATABASE_URL>_test`` and load ``db/schema.sql`` into it (Invariant 9)."""
+    create_test_database()
+    apply_schema()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_database_ready() -> Iterator[None]:
+    """Make the isolated test database ready before any test can touch it.
+
+    This used to happen only inside `postgres_database`, so a test that talks to
+    `repository` *without* requesting that fixture — the admin-command tests — died as soon
+    as the database was not there yet. Measured after `docker compose down -v`, which is
+    exactly what a first run on CI or a new clone looks like: 16 failures, and whether the
+    suite passed at all depended on test order.
+
+    Best effort on purpose: with no Postgres reachable the unit tests still run untouched,
+    and the tests that genuinely need a database skip themselves (see `postgres_database`).
+    """
+    try:
+        prepare_test_database()
+    except psycopg.OperationalError:
+        pass
+    yield
+
+
 @pytest.fixture(scope="session")
 def postgres_database() -> str:
     """URL of the isolated Postgres under test, or a skip when none is reachable."""
     try:
-        create_test_database()
-        apply_schema()
+        prepare_test_database()
     except psycopg.OperationalError as exc:
         pytest.skip(
             f"no Postgres at {DATABASE_URL} ({exc}); start it with `docker compose up -d db`"

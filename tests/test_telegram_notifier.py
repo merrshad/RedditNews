@@ -27,11 +27,17 @@ class FakeResponse:
     """The parts of ``httpx.Response`` the notifier reads (status + JSON body)."""
 
     def __init__(
-        self, status_code: int = 200, body: object = None, *, valid_json: bool = True
+        self,
+        status_code: int = 200,
+        body: object = None,
+        *,
+        valid_json: bool = True,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self._body = {"ok": True, "result": {"message_id": 1}} if body is None else body
         self._valid_json = valid_json
+        self.headers = headers or {}
 
     def json(self) -> object:
         if not self._valid_json:
@@ -110,6 +116,83 @@ def test_send_message_returns_false_after_retries_when_telegram_rejects(
     # No exception may escape: the pipeline decides 'sent' vs keep for the next run.
     assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 3  # HTTP_MAX_RETRIES: throttling and 5xx may pass later
+
+
+# --- 429: honour the wait Telegram announces -------------------------------------------
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture every wait, so a test can tell the announced delay from the backoff."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    return sleeps
+
+
+def _too_many_requests(*, parameters: dict[str, object] | None = None, headers=None) -> FakeResponse:
+    body: dict[str, object] = {"ok": False, "description": "Too Many Requests: retry after 30"}
+    if parameters is not None:
+        body["parameters"] = parameters
+    return FakeResponse(status_code=429, body=body, headers=headers)
+
+
+def test_a_rate_limit_is_waited_out_for_the_announced_time(
+    http: FakeHttp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observed for real: 25 review messages in one burst got `retry after 30` and the plain
+    1s/2s backoff could not cover it, so 3 posts were left for the next cycle. Waiting the
+    announced time is what makes the batch actually land.
+    """
+    sleeps = _record_sleeps(monkeypatch)
+    http.queue = [_too_many_requests(parameters={"retry_after": 30})]
+    http.default = FakeResponse()
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
+    assert sleeps[0] == 30
+
+
+def test_the_announced_wait_is_capped(http: FakeHttp, monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps = _record_sleeps(monkeypatch)
+    http.queue = [_too_many_requests(parameters={"retry_after": 600})]
+    http.default = FakeResponse()
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
+    assert sleeps[0] == telegram_notifier.MAX_RETRY_AFTER_SECONDS
+
+
+def test_the_retry_after_header_is_used_when_the_body_has_no_hint(
+    http: FakeHttp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps = _record_sleeps(monkeypatch)
+    http.queue = [_too_many_requests(headers={"Retry-After": "12"})]
+    http.default = FakeResponse()
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
+    assert sleeps[0] == 12
+
+
+def test_without_any_hint_only_the_normal_backoff_applies(
+    http: FakeHttp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps = _record_sleeps(monkeypatch)
+    http.queue = [_too_many_requests(), _too_many_requests(headers={"Retry-After": "nonsense"})]
+    http.default = FakeResponse()
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
+    assert all(seconds < 5 for seconds in sleeps)
+
+
+def test_the_throttle_wait_is_logged_without_the_token(
+    http: FakeHttp, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _record_sleeps(monkeypatch)
+    http.queue = [_too_many_requests(parameters={"retry_after": 30})]
+    http.default = FakeResponse()
+
+    with caplog.at_level(logging.WARNING):
+        assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
+
+    assert "throttling sendMessage" in caplog.text
+    assert TOKEN not in caplog.text
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404])
