@@ -140,6 +140,32 @@ def test_the_config_directory_is_gone() -> None:
     assert not (PROJECT_ROOT / "config").exists()
 
 
+def _dockerfile_copy_sources() -> list[str]:
+    text = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    return re.findall(r"^COPY\s+(?:--\S+\s+)*(\S+)", text, re.MULTILINE)
+
+
+def _compose_host_mounts() -> list[str]:
+    text = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    return re.findall(r"^\s+-\s+(\./[^:]+):", text, re.MULTILINE)
+
+
+def test_every_path_the_dockerfile_copies_exists() -> None:
+    """Observed for real: deleting `config/` left `COPY config ./config` behind, and
+    `docker compose up --build` died with `failed to compute cache key: "/config": not
+    found` — after the suite was green. Build inputs need a guard of their own.
+    """
+    sources = _dockerfile_copy_sources()
+    assert sources, "the Dockerfile must copy at least one path"
+    assert [source for source in sources if not (PROJECT_ROOT / source).exists()] == []
+
+
+def test_every_host_path_docker_compose_mounts_exists() -> None:
+    mounts = _compose_host_mounts()
+    assert mounts, "the db service mounts db/schema.sql, so at least one path is expected"
+    assert [mount for mount in mounts if not (PROJECT_ROOT / mount).exists()] == []
+
+
 @pytest.mark.parametrize(
     ("module", "attribute"),
     [
