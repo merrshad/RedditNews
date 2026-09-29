@@ -15,8 +15,9 @@ and broke five candidate/duplicate tests (observed). Isolating the two is what k
 
 from __future__ import annotations
 
+import asyncio
 import os
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -56,6 +57,17 @@ TEST_SOURCE_URL_PREFIX = "https://test.example/"
 TEST_DATABASE_SUFFIX = "_test"
 
 
+def run(awaitable: Awaitable[Any]) -> Any:
+    """Drive one coroutine from a synchronous test.
+
+    The whole bot is awaitable since phase 6, but the tests deliberately stay plain
+    ``def`` functions: the default event loop is perfectly capable of running one call to
+    completion, and that keeps the suite free of a pytest-asyncio (or anyio) dependency for
+    assertions that are about behaviour, not about concurrency.
+    """
+    return asyncio.run(awaitable)
+
+
 def _with_test_suffix(url: str) -> str:
     """`postgresql://.../reddit_digest` -> `postgresql://.../reddit_digest_test`.
 
@@ -85,7 +97,7 @@ class FakeChatCompletion:
         self.answer = answer
         self.calls: list[tuple[str, str]] = []
 
-    def __call__(self, system_prompt: str, user_prompt: str) -> str:
+    async def __call__(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         return self.answer
 
@@ -107,13 +119,13 @@ class FakeTelegram:
         self.default_chat_id: str = ""
         #: (text, chat_id, reply_markup)
         self.sent: list[tuple[str, str | None, dict[str, Any] | None]] = []
-        #: (text, chat_id, message_id)
-        self.edits: list[tuple[str, str, int]] = []
+        #: (reply_markup, chat_id, message_id) — one entry per keyboard re-draw
+        self.keyboard_edits: list[tuple[dict[str, Any], str, int]] = []
         #: (callback_query_id, answer text)
         self.answers: list[tuple[str, str | None]] = []
         self._message_id = 1000
 
-    def send_message(
+    async def send_message(
         self,
         text: str,
         *,
@@ -129,18 +141,17 @@ class FakeTelegram:
         self.sent.append((text, chat_id or self.default_chat_id, reply_markup))
         return self._message_id
 
-    def edit_message_text(
+    async def edit_message_reply_markup(
         self,
-        text: str,
         *,
         chat_id: str,
         message_id: int,
-        reply_markup: dict[str, Any] | None = None,
+        reply_markup: dict[str, Any],
     ) -> bool:
-        self.edits.append((text, chat_id, message_id))
+        self.keyboard_edits.append((reply_markup, chat_id, message_id))
         return True
 
-    def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> bool:
+    async def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> bool:
         self.answers.append((callback_query_id, text))
         return True
 
@@ -151,6 +162,15 @@ class FakeTelegram:
     def buttons_to(self, chat_id: str | None) -> list[dict[str, Any] | None]:
         return [markup for _, target, markup in self.sent if target == chat_id]
 
+    def buttons_of(self, message_id: int) -> list[str]:
+        """The button labels of the latest keyboard drawn for one message."""
+        markup = next(
+            (markup for markup, _, edited in self.keyboard_edits if edited == message_id), None
+        )
+        if markup is None:
+            return []
+        return [button["text"] for row in markup["inline_keyboard"] for button in row]
+
 
 def patch_telegram(
     monkeypatch: pytest.MonkeyPatch, fake: FakeTelegram, *, default_chat_id: str = ""
@@ -159,7 +179,9 @@ def patch_telegram(
     if default_chat_id:
         fake.default_chat_id = default_chat_id
     monkeypatch.setattr("app.telegram_notifier.send_message", fake.send_message)
-    monkeypatch.setattr("app.telegram_notifier.edit_message_text", fake.edit_message_text)
+    monkeypatch.setattr(
+        "app.telegram_notifier.edit_message_reply_markup", fake.edit_message_reply_markup
+    )
     monkeypatch.setattr(
         "app.telegram_notifier.answer_callback_query", fake.answer_callback_query
     )

@@ -3,15 +3,18 @@
 ``chat_completion`` builds the client from the configured ``settings``, sends the two
 messages and returns the assistant text. Parsing/validation of that text is *not* done
 here — that belongs to ``analyzer.py`` (AGENTS.md section 12, separation of concerns).
+
+Phase 6: the call is awaitable (``AsyncOpenAI``), so a slow model answer no longer freezes
+the worker while an admin is pressing a button.
 """
 
 from __future__ import annotations
 
 import logging
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from app.retry import PermanentError, call_with_retries
+from app.retry import PermanentError, call_with_retries_async
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -27,7 +30,7 @@ class LlmError(RuntimeError):
     """Raised when the LLM call does not succeed within the attempt budget."""
 
 
-def chat_completion(system_prompt: str, user_prompt: str) -> str:
+async def chat_completion(system_prompt: str, user_prompt: str) -> str:
     """Send one system+user prompt and return the raw text of the first choice.
 
     The whole call runs behind the shared retry/backoff helper (Invariant 8, NFR-2).
@@ -35,15 +38,15 @@ def chat_completion(system_prompt: str, user_prompt: str) -> str:
     never the API key (Invariant 6, NFR-4).
     """
     settings = get_settings()
-    client = OpenAI(
+    client = AsyncOpenAI(
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
-    def _call() -> str:
+    async def _call() -> str:
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=settings.openai_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -62,7 +65,7 @@ def chat_completion(system_prompt: str, user_prompt: str) -> str:
         return (response.choices[0].message.content or "").strip()
 
     try:
-        return call_with_retries(
+        return await call_with_retries_async(
             _call,
             attempts=settings.http_max_retries,
             description=f"LLM chat completion (model={settings.openai_model})",

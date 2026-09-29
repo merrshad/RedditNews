@@ -131,6 +131,9 @@ class PostRecord(BaseModel):
     status: PostStatus = "new"
     review_status: ReviewStatus = "pending_review"
     reviewed_by: str | None = None
+    # The admin's Telegram display name at decision time, so the review message can show
+    # *who* decided without another API call (phase 6). `reviewed_by` stays the authority.
+    reviewed_by_name: str | None = None
     reviewed_at: datetime | None = None
     approved_at: datetime | None = None
     rejected_at: datetime | None = None

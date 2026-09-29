@@ -7,14 +7,18 @@ Postgres, managed by the admin), so the caller passes :class:`SourceRecord` rows
 The batch cap is ``min(source.fetch_limit or default_fetch_limit, available items)``:
 a source set to 50 whose document holds 17 items yields 17, and the number 25 is only
 ever the configured default (``RSS_FETCH_LIMIT``), never a property of the code.
+
+Phase 6 made the fetching side awaitable: every feed is an independent HTTP request, so
+:func:`fetch_all` runs up to ``MAX_CONCURRENT_FEEDS`` of them at the same time instead of
+one after another, while parsing stays pure and synchronous.
 """
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from html import unescape
 from typing import Any, Iterable, Sequence
@@ -23,12 +27,16 @@ import feedparser
 import httpx
 
 from app.models import RawPost, SourceRecord, TopicRecord
-from app.retry import PermanentError, retryable
+from app.retry import PermanentError, async_sleep, retryable
 
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "reddit-telegram-digest/0.1 (+RSS reader)"
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+# How many feeds may be in flight at once. A handful is enough to hide the latency of a
+# slow feed without turning a cycle into a burst that Reddit rate-limits (NFR-6).
+MAX_CONCURRENT_FEEDS = 4
 
 # Reddit answers 429 (not 403) when it rate-limits the `.rss` endpoints, and sends a
 # `Retry-After` header with it. Honouring that header is the difference between backing
@@ -171,8 +179,18 @@ def _retry_after_seconds(response: httpx.Response) -> float:
     return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
 
 
+async def _get(feed_url: str) -> httpx.Response:
+    """One HTTP GET — the only network call in this module (tests replace this seam)."""
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        follow_redirects=True,
+    ) as client:
+        return await client.get(feed_url)
+
+
 @retryable(description=lambda feed_url: f"fetch RSS feed {feed_url}")
-def fetch_feed(feed_url: str) -> bytes:
+async def fetch_feed(feed_url: str) -> bytes:
     """Download one feed document with bounded retries and backoff (NFR-2).
 
     The attempt budget comes from ``HTTP_MAX_RETRIES`` (``app/retry.py``). Feed URLs
@@ -182,12 +200,7 @@ def fetch_feed(feed_url: str) -> bytes:
     gone) would fail identically forever, so it raises :class:`PermanentError` and the
     run moves on to the next feed at once (Invariant 8).
     """
-    response = httpx.get(
-        feed_url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        follow_redirects=True,
-    )
+    response = await _get(feed_url)
 
     status = response.status_code
     if status == RATE_LIMIT_STATUS:
@@ -196,7 +209,7 @@ def fetch_feed(feed_url: str) -> bytes:
             logger.warning(
                 "Feed %s is rate-limited; waiting %.0fs before retrying", feed_url, delay
             )
-            time.sleep(delay)
+            await async_sleep(delay)
     elif 400 <= status < 500:
         # 429 is handled above, so anything left here is the request's own fault (404 feed
         # deleted, 403 blocked, 400 malformed) and would fail identically forever.
@@ -207,7 +220,7 @@ def fetch_feed(feed_url: str) -> bytes:
     return response.content
 
 
-def fetch_source(source: SourceRecord, *, default_fetch_limit: int) -> list[RawPost]:
+async def fetch_source(source: SourceRecord, *, default_fetch_limit: int) -> list[RawPost]:
     """Fetch and parse one source, capped at its own (or the global) limit (FR-1).
 
     Returns ``[]`` when the feed is unreachable or unparsable: one dead feed must never
@@ -216,7 +229,7 @@ def fetch_source(source: SourceRecord, *, default_fetch_limit: int) -> list[RawP
     """
     limit = source.fetch_limit or default_fetch_limit
     try:
-        content = fetch_feed(source.rss_url)
+        content = await fetch_feed(source.rss_url)
         parsed_posts = parse_feed(
             content, source_topic_key=source.topic_key, feed_url=source.rss_url
         )
@@ -235,21 +248,35 @@ def fetch_source(source: SourceRecord, *, default_fetch_limit: int) -> list[RawP
     return kept
 
 
-def fetch_all(
+async def fetch_all(
     sources: Sequence[SourceRecord], *, default_fetch_limit: int
 ) -> list[RawPost]:
-    """Fetch and parse every configured source (FR-1).
+    """Fetch and parse every configured source, a few of them at a time (FR-1).
 
     Items are de-duplicated by ``reddit_id`` within the batch, keeping the first
     occurrence (Invariant 1): the same post can legitimately appear in two feeds (a
     subreddit and a cross-post), and the exact duplicate check in the database can only
     see what was stored before this run.
+
+    The sources are independent, so they are fetched concurrently (bounded by
+    :data:`MAX_CONCURRENT_FEEDS`) and then flattened **in the configured order**, which
+    keeps the result — and therefore the review messages — deterministic.
     """
+    if not sources:
+        return []
+
+    gate = asyncio.Semaphore(MAX_CONCURRENT_FEEDS)
+
+    async def _gated(source: SourceRecord) -> list[RawPost]:
+        async with gate:
+            return await fetch_source(source, default_fetch_limit=default_fetch_limit)
+
+    batches = await asyncio.gather(*(_gated(source) for source in sources))
+
     posts: list[RawPost] = []
     seen: set[str] = set()
-
-    for source in sources:
-        for post in fetch_source(source, default_fetch_limit=default_fetch_limit):
+    for batch in batches:
+        for post in batch:
             if post.reddit_id in seen:
                 continue
             seen.add(post.reddit_id)

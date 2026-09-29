@@ -1,24 +1,33 @@
-"""Entry point: long-poll the bot for admin decisions and run the pipeline on schedule.
+"""Entry point: one asyncio event loop running the worker's two jobs side by side.
 
-Phase 5 made the worker two interleaved jobs in one process:
+The worker has always had two jobs; phase 6 stops them taking turns. ``run_forever`` opens an
+``asyncio.TaskGroup`` with two long-lived tasks:
 
-- it long-polls Telegram (``app.telegram_updates``), so a ✅/❌ press is acted on within
-  seconds, and
-- it runs ``pipeline.run_once()`` every ``POLL_INTERVAL_SECONDS``.
+- ``_updates_loop`` long-polls Telegram (``app.telegram_updates``) so a ✅/❌ press or a panel
+  button is handled within seconds, and
+- ``_pipeline_loop`` runs ``pipeline.run_once()`` every ``POLL_INTERVAL_SECONDS`` and the much
+  cheaper ``process_approved_posts()`` as soon as a decision really changed a row.
 
-Deliberately still no scheduler dependency, no queue and no threads (YAGNI, AGENTS.md
-section 8). Two guarantees matter here: a failing cycle must never kill the worker
-(NFR-2), and ``docker stop`` (SIGTERM) must end the process cleanly instead of waiting for
-a poll or a timeout.
+Before this, the single ``while True`` did one thing at a time: a cycle that spent a minute on
+RSS fetches, model calls and review messages made every button press wait for it, which is
+exactly the sluggishness the admin noticed. Two tasks in one loop is still one process, one
+set of credentials and no queue — the old constraint (only one consumer may call ``getUpdates``)
+is kept: ``_updates_loop`` is the only place that polls.
+
+Deliberately still no scheduler dependency and no message queue (YAGNI, AGENTS.md section 8).
+Two guarantees matter here: a failing cycle must never kill the worker (NFR-2), and
+``docker stop`` (SIGTERM) must end the process cleanly instead of waiting for a poll or a
+timeout.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import psycopg
 
@@ -56,8 +65,8 @@ def setup_logging(level: str) -> None:
 def _request_shutdown(_signum: int, _frame: object) -> None:
     """Translate SIGTERM/SIGINT into the same clean exit path as Ctrl+C.
 
-    Raising ``KeyboardInterrupt`` also interrupts the long poll and the short sleep
-    between polls, so the container stops immediately.
+    Raising ``KeyboardInterrupt`` also interrupts whatever the event loop is waiting on
+    (the long poll, a backoff sleep), so the container stops immediately.
     """
     raise KeyboardInterrupt
 
@@ -67,41 +76,85 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _request_shutdown)
 
 
-def _run_safely(step: Callable[[], None]) -> None:
+async def _sleep(seconds: float) -> None:
+    """The loop's only wait, in one place so a test can drive the schedule (NFR-8)."""
+    await asyncio.sleep(seconds)
+
+
+async def _run_safely(step: Callable[[], Awaitable[None]]) -> None:
     """Run one worker step; a failure is logged and never ends the loop (NFR-2)."""
     try:
-        step()
+        await step()
     except Exception:
         logger.exception("%s failed; continuing", getattr(step, "__name__", step))
 
 
-def run_forever() -> None:
-    """Poll for decisions forever, running a full pipeline cycle on its own schedule."""
-    settings = get_settings()
+async def _updates_loop(decision: asyncio.Event) -> None:
+    """Consume Telegram updates forever, signalling every real review decision.
+
+    The long poll is the task's own wait, so it costs nothing while a cycle runs: the
+    scheduler task is free to work, and this one wakes up the moment Telegram answers.
+    """
     offset: int | None = None
-    next_cycle_at = 0.0
 
     while True:
-        due = time.monotonic() >= next_cycle_at
         started = time.monotonic()
+        result: telegram_updates.PollResult | None
+        try:
+            result = await telegram_updates.poll_once(
+                offset, long_poll_seconds=LONG_POLL_SECONDS
+            )
+        except Exception:
+            # `poll_once` contains its own per-update guard; anything reaching here is a bug,
+            # and it must not take the worker down (NFR-2).
+            logger.exception("The Telegram update loop failed; retrying shortly")
+            result = None
 
-        # When a cycle is due, do not sit in a long poll first: ask for updates and go.
-        result = telegram_updates.poll_once(
-            offset, long_poll_seconds=0 if due else LONG_POLL_SECONDS
-        )
-        offset = result.offset
-
-        if due:
-            _run_safely(pipeline.run_once)
-            next_cycle_at = time.monotonic() + settings.poll_interval_seconds
-        elif result.decisions:
-            # An admin pressed a button and is waiting: analyse/publish right away,
-            # without dragging a full RSS cycle in (the fetch keeps its own schedule).
-            _run_safely(pipeline.process_approved_posts)
+        if result is not None:
+            offset = result.offset
+            if result.decisions:
+                # An admin pressed a button and is waiting: analyse/publish right away.
+                decision.set()
 
         elapsed = time.monotonic() - started
         if elapsed < MIN_POLL_INTERVAL_SECONDS:
-            time.sleep(MIN_POLL_INTERVAL_SECONDS - elapsed)
+            await _sleep(MIN_POLL_INTERVAL_SECONDS - elapsed)
+
+
+async def _wait_for_decision(decision: asyncio.Event, timeout: float) -> bool:
+    """Wait up to ``timeout`` for a review decision; ``True`` when one arrived first."""
+    try:
+        await asyncio.wait_for(decision.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return False
+    decision.clear()
+    return True
+
+
+async def _pipeline_loop(decision: asyncio.Event) -> None:
+    """Run a full cycle on its own schedule, and the fast path after every decision."""
+    settings = get_settings()
+
+    while True:
+        await _run_safely(pipeline.run_once)
+        if await _wait_for_decision(decision, settings.poll_interval_seconds):
+            # The cycle above already drained the queues, so only the newly approved posts
+            # are left; the RSS fetch keeps its own schedule.
+            await _run_safely(pipeline.process_approved_posts)
+
+
+async def run_forever() -> None:
+    """Poll for button presses and run the pipeline, concurrently, until shutdown."""
+    decision = asyncio.Event()
+    try:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(_updates_loop(decision), name="telegram-updates")
+            group.create_task(_pipeline_loop(decision), name="pipeline")
+    except* KeyboardInterrupt:
+        # SIGTERM/SIGINT is delivered to whichever task is parked in an await, so it can
+        # arrive as a child-task failure inside the group. Both spellings must mean the
+        # same thing, or `docker stop` would exit with a traceback instead of cleanly.
+        raise KeyboardInterrupt from None
 
 
 def preflight() -> None:
@@ -139,7 +192,7 @@ def main() -> None:
     )
 
     try:
-        run_forever()
+        asyncio.run(run_forever())
     except KeyboardInterrupt:
         logger.info("Shutdown requested, exiting")
 

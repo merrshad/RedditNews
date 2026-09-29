@@ -38,6 +38,7 @@ from tests.conftest import (
     insert_source,
     insert_topic,
     patch_telegram,
+    run,
     temp_topic_key,
 )
 
@@ -50,6 +51,21 @@ TOPIC_KEY = temp_topic_key("itest")
 REVIEW_CHANNEL = "-100999"
 PUBLIC_CHANNEL = "-100123"
 ADMIN_ID = "777"
+
+# The same thin wrappers `test_pipeline.py` uses: the entry points are awaitable since
+# phase 6, and these tests stay synchronous one `asyncio.run` deep.
+
+
+def _run_once() -> None:
+    run(pipeline.run_once())
+
+
+def _process_approved_posts() -> None:
+    run(pipeline.process_approved_posts())
+
+
+def _decide(callback_query: dict[str, Any]) -> bool:
+    return run(review.handle_callback(callback_query))
 
 
 def _answer(**overrides: Any) -> str:
@@ -98,10 +114,12 @@ def _patch_feed(
     posts the pipeline will see.
     """
     document = _feed_document(entries=entries)
-    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: document)
-    return real_fetch_all(
-        _active_sources(), default_fetch_limit=25
-    )
+
+    async def _fetch_feed(_feed_url: str) -> bytes:
+        return document
+
+    monkeypatch.setattr("app.reddit_source.fetch_feed", _fetch_feed)
+    return run(real_fetch_all(_active_sources(), default_fetch_limit=25))
 
 
 def _active_sources():
@@ -151,7 +169,7 @@ def _approve_everything(connection: psycopg.Connection) -> None:
             "from": {"id": int(ADMIN_ID)},
             "message": {"message_id": 1, "chat": {"id": int(REVIEW_CHANNEL)}},
         }
-        assert review.handle_callback(callback) is True
+        assert _decide(callback) is True
 
 
 # --- Invariant 1 + FR-12/FR-13: the whole path, twice ------------------------------
@@ -166,7 +184,7 @@ def test_two_cycles_store_review_approve_publish_and_never_repeat_themselves(
     fetched = _patch_feed(monkeypatch, entries=5)
     telegram, llm = _patch_boundaries(monkeypatch, settings=settings)
 
-    pipeline.run_once()
+    _run_once()
     first_run = _rows(taxonomy)
 
     assert len(fetched) == 5
@@ -184,7 +202,7 @@ def test_two_cycles_store_review_approve_publish_and_never_repeat_themselves(
 
     # The second cycle sees the identical feed document again — a normal situation, since
     # a polling worker keeps reading the same feed. Nothing may change.
-    pipeline.run_once()
+    _run_once()
 
     assert len(llm.calls) == 0
     assert len(telegram.messages_to(REVIEW_CHANNEL)) == 5
@@ -192,7 +210,7 @@ def test_two_cycles_store_review_approve_publish_and_never_repeat_themselves(
 
     # An admin approves all five; the AI step runs on the next `main` tick.
     _approve_everything(taxonomy)
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     assert len(llm.calls) == 5  # exactly one call per approved post
     published = telegram.messages_to(PUBLIC_CHANNEL)
@@ -205,7 +223,7 @@ def test_two_cycles_store_review_approve_publish_and_never_repeat_themselves(
     assert any("اهمیت: بالا" in message and "🔑 نکات کلیدی:" in message for message in published)
 
     # A third cycle changes nothing at all: analysed once, published once.
-    pipeline.run_once()
+    _run_once()
 
     assert len(llm.calls) == 5
     assert len(telegram.messages_to(PUBLIC_CHANNEL)) == 5
@@ -248,9 +266,9 @@ def test_the_llm_never_receives_more_candidates_than_the_lookback_limit(
     bounded = settings.model_copy(update={"similarity_lookback_limit": limit})
     telegram, llm = _patch_boundaries(monkeypatch, settings=bounded)
 
-    pipeline.run_once()
+    _run_once()
     _approve_everything(taxonomy)
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     assert len(llm.calls) == 1
     _, user_prompt = llm.calls[0]
@@ -278,26 +296,26 @@ def test_a_rejected_publication_is_recovered_by_the_next_run(
     telegram = FakeTelegram()
     _, llm = _patch_boundaries(monkeypatch, settings=settings, telegram=telegram)
 
-    pipeline.run_once()  # the three review messages do get delivered
+    _run_once()  # the three review messages do get delivered
     _approve_everything(taxonomy)
     assert len(telegram.messages_to(REVIEW_CHANNEL)) == 3
 
     telegram.fail_next_sends = 3  # ... and now Telegram refuses the publications
-    pipeline.process_approved_posts()
+    _process_approved_posts()
 
     assert [row["status"] for row in _rows(taxonomy)] == ["to_send"] * 3
     assert len(llm.calls) == 3
     assert telegram.messages_to(PUBLIC_CHANNEL) == []
 
     # The next cycle brings no new RSS item at all; only the leftover rows are retried.
-    monkeypatch.setattr(
-        "app.reddit_source.fetch_feed",
-        lambda feed_url: b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>',
-    )
+    async def _empty_feed(_feed_url: str) -> bytes:
+        return b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+    monkeypatch.setattr("app.reddit_source.fetch_feed", _empty_feed)
     recovery = FakeTelegram()
     _patch_boundaries(monkeypatch, settings=settings, telegram=recovery, llm=llm)
 
-    pipeline.run_once()
+    _run_once()
 
     recovered = _rows(taxonomy)
     assert [row["status"] for row in recovered] == ["sent"] * 3

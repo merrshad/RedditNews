@@ -4,18 +4,21 @@
 the retry policy of the real call. It matters because a *permanent* provider rejection
 (an invalid key, an unknown model) used to consume the whole retry budget with backoff
 sleeps — measured in a real phase-4 run at ~6s per post instead of ~1.5s.
+
+Phase 6: the transport is `AsyncOpenAI` and the client is awaited, so the fakes here are
+async too and the backoff wait is `app.retry.async_sleep`.
 """
 
 from __future__ import annotations
 
 import os
-import time
 from typing import Any
 
 import pytest
 
 from app import llm_client
 from app.retry import PermanentError
+from tests.conftest import run
 
 
 class _ProviderError(Exception):
@@ -27,11 +30,11 @@ class _ProviderError(Exception):
 
 
 def _fake_client(monkeypatch: pytest.MonkeyPatch, error: Exception) -> list[int]:
-    """Point `llm_client.OpenAI` at a client whose only job is to raise ``error``."""
+    """Point `llm_client.AsyncOpenAI` at a client whose only job is to raise ``error``."""
     calls: list[int] = []
 
     class _Completions:
-        def create(self, **kwargs: Any) -> Any:
+        async def create(self, **kwargs: Any) -> Any:
             calls.append(1)
             raise error
 
@@ -42,10 +45,15 @@ def _fake_client(monkeypatch: pytest.MonkeyPatch, error: Exception) -> list[int]
         def __init__(self, **kwargs: Any) -> None:
             self.chat = _Chat()
 
-    monkeypatch.setattr(llm_client, "OpenAI", _Client)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(llm_client, "AsyncOpenAI", _Client)
+    # `retryable` resolves the wait at call time, so nothing here really sleeps.
+    monkeypatch.setattr("app.retry.async_sleep", _no_wait)
     monkeypatch.setenv("HTTP_MAX_RETRIES", "3")
     return calls
+
+
+async def _no_wait(_seconds: float) -> None:
+    return None
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404])
@@ -55,7 +63,7 @@ def test_a_rejected_request_is_not_retried(
     calls = _fake_client(monkeypatch, _ProviderError(status_code))
 
     with pytest.raises(PermanentError):
-        llm_client.chat_completion("system", "user")
+        run(llm_client.chat_completion("system", "user"))
 
     assert len(calls) == 1  # the key will not become valid on the second attempt
 
@@ -67,7 +75,7 @@ def test_a_temporary_provider_problem_is_still_retried(
     calls = _fake_client(monkeypatch, _ProviderError(status_code))
 
     with pytest.raises(llm_client.LlmError):  # ordinary failure, wrapped as before
-        llm_client.chat_completion("system", "user")
+        run(llm_client.chat_completion("system", "user"))
 
     assert len(calls) == 3  # HTTP_MAX_RETRIES
 
@@ -84,7 +92,7 @@ def test_the_failure_after_the_last_attempt_keeps_the_provider_diagnosis(
     monkeypatch.setenv("HTTP_MAX_RETRIES", "2")
 
     with pytest.raises(llm_client.LlmError) as excinfo:
-        llm_client.chat_completion("system", "user")
+        run(llm_client.chat_completion("system", "user"))
 
     assert len(calls) == 2  # the configured budget, not more and not fewer
     message = str(excinfo.value)
@@ -99,7 +107,7 @@ def test_a_single_configured_attempt_is_honoured(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("HTTP_MAX_RETRIES", "1")
 
     with pytest.raises(llm_client.LlmError):
-        llm_client.chat_completion("system", "user")
+        run(llm_client.chat_completion("system", "user"))
 
     assert len(calls) == 1
 
@@ -115,7 +123,7 @@ def test_an_answer_without_choices_is_an_error(monkeypatch: pytest.MonkeyPatch) 
         choices: list[Any] = []
 
     class _Completions:
-        def create(self, **kwargs: Any) -> _Response:
+        async def create(self, **kwargs: Any) -> _Response:
             return _Response()
 
     class _Chat:
@@ -125,12 +133,12 @@ def test_an_answer_without_choices_is_an_error(monkeypatch: pytest.MonkeyPatch) 
         def __init__(self, **kwargs: Any) -> None:
             self.chat = _Chat()
 
-    monkeypatch.setattr(llm_client, "OpenAI", _Client)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(llm_client, "AsyncOpenAI", _Client)
+    monkeypatch.setattr("app.retry.async_sleep", _no_wait)
     monkeypatch.setenv("HTTP_MAX_RETRIES", "1")
 
     with pytest.raises(llm_client.LlmError, match="no choices"):
-        llm_client.chat_completion("system", "user")
+        run(llm_client.chat_completion("system", "user"))
 
 
 def test_the_returned_text_is_the_first_choice(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,7 +152,7 @@ def test_the_returned_text_is_the_first_choice(monkeypatch: pytest.MonkeyPatch) 
         choices = [_Choice()]
 
     class _Completions:
-        def create(self, **kwargs: Any) -> _Response:
+        async def create(self, **kwargs: Any) -> _Response:
             return _Response()
 
     class _Chat:
@@ -154,6 +162,6 @@ def test_the_returned_text_is_the_first_choice(monkeypatch: pytest.MonkeyPatch) 
         def __init__(self, **kwargs: Any) -> None:
             self.chat = _Chat()
 
-    monkeypatch.setattr(llm_client, "OpenAI", _Client)
+    monkeypatch.setattr(llm_client, "AsyncOpenAI", _Client)
 
-    assert llm_client.chat_completion("system", "user") == "the answer"
+    assert run(llm_client.chat_completion("system", "user")) == "the answer"

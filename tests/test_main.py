@@ -1,52 +1,60 @@
-"""Tests for the worker loop in ``app/main.py``.
+"""Tests for the worker in ``app/main.py``.
 
-Phase 5 gave the worker two jobs in one loop: long-poll Telegram for admin decisions, and
-run a full pipeline cycle on its own schedule. The loop is the last safety net of the
-service — a failing cycle must never end it (NFR-2), a decision must not have to wait for
-the next scheduled cycle, and a shutdown signal must end it cleanly.
+Phase 6 turned the single ``while True`` into one asyncio event loop with two tasks: one
+long-polls Telegram, the other keeps the pipeline schedule. The loop is the last safety net
+of the service — a failing cycle must never end it (NFR-2), a press must be handled *while* a
+cycle is still running, and a shutdown signal must end it cleanly.
+
+The tests drive the real ``main()`` with the two waits replaced (``app.main._sleep`` and
+``app.main._wait_for_decision``), so they are about the scheduling rules and never about
+really waiting.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import signal
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
-
-from urllib.parse import urlsplit, urlunsplit
 
 from app import main, repository
 from app.settings import Settings
 from app.telegram_updates import PollResult
-from tests.conftest import TEST_DATABASE_URL
+from tests.conftest import TEST_DATABASE_URL, run
 
 
 class _Clock:
-    """A virtual clock: the loop's schedule only moves when it sleeps.
+    """The loop's virtual schedule: every wait is counted, and the nth one ends the loop.
 
-    ``time.sleep`` is faked anyway (the loop must not really wait), and a fake that does
-    not advance ``time.monotonic`` would make ``next_cycle_at`` unreachable, so the two are
-    faked together. The nth sleep raises what the signal handler raises under the hood.
+    ``_sleep`` is the update loop's own floor (it must never really wait) and
+    ``_wait_for_decision`` is the pipeline's wait between two cycles. Neither may sleep for
+    real, and the nth wait raises what a shutdown signal raises under the hood.
     """
 
-    def __init__(self, stop_after_sleeps: int) -> None:
-        self.now = 0.0
+    def __init__(self, stop_after_waits: int) -> None:
         self.slept: list[float] = []
-        self._stop_after = stop_after_sleeps
+        self.waits = 0
+        self._stop_after = stop_after_waits
 
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
+    async def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
-        self.now += seconds
-        if len(self.slept) >= self._stop_after:
+        # Yield, like the real `asyncio.sleep` does: a wait that never hands control back
+        # would starve the other task and turn these tests into a hang.
+        await asyncio.sleep(0)
+
+    async def wait_for_decision(self, decision: asyncio.Event, timeout: float) -> bool:
+        await asyncio.sleep(0)
+        self.waits += 1
+        if self.waits >= self._stop_after:
             raise KeyboardInterrupt
+        return False
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> "_Clock":
-        monkeypatch.setattr("app.main.time.monotonic", self.monotonic)
-        monkeypatch.setattr("app.main.time.sleep", self.sleep)
+        monkeypatch.setattr("app.main._sleep", self.sleep)
+        monkeypatch.setattr("app.main._wait_for_decision", self.wait_for_decision)
         return self
 
 
@@ -58,59 +66,11 @@ def _quiet(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
     monkeypatch.setattr("app.main.preflight", lambda: None)
 
 
-def test_main_keeps_cycling_after_a_failed_run_and_stops_on_shutdown(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings
-) -> None:
-    cycles: list[int] = []
-
-    def _run_once() -> None:
-        cycles.append(len(cycles) + 1)
-        if len(cycles) == 2:
-            raise RuntimeError("the LLM provider exploded")
-
-    _quiet(monkeypatch, settings)
-    monkeypatch.setattr("app.main.telegram_updates.poll_once", _polling([]))
-    monkeypatch.setattr("app.pipeline.run_once", _run_once)
-    clock = _Clock(stop_after_sleeps=2).install(monkeypatch)
-
-    main.main()  # returns normally instead of propagating the failure
-
-    assert cycles == [1, 2]
-    # When Telegram answers immediately there is nothing to wait for, so the loop floors
-    # itself instead of spinning; every entry is that floor.
-    assert clock.slept and all(0 < seconds <= main.MIN_POLL_INTERVAL_SECONDS for seconds in clock.slept)
-
-
-def test_a_decision_is_processed_without_waiting_for_the_next_cycle(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings
-) -> None:
-    """A click must be answered in seconds, not after `POLL_INTERVAL_SECONDS`."""
-    slow_cycles = settings.model_copy(update={"poll_interval_seconds": 3600})
-    long_polls: list[int] = []
-    processed: list[str] = []
-
-    _quiet(monkeypatch, slow_cycles)
-    monkeypatch.setattr("app.main.telegram_updates.poll_once", _polling([0, 1], long_polls))
-    monkeypatch.setattr("app.pipeline.run_once", lambda: processed.append("cycle"))
-    monkeypatch.setattr(
-        "app.pipeline.process_approved_posts", lambda: processed.append("decision")
-    )
-    _Clock(stop_after_sleeps=2).install(monkeypatch)
-
-    main.main()
-
-    assert processed == ["cycle", "decision"]
-    # The first iteration had a cycle due, so it asked for updates without blocking; the
-    # second one could afford to wait for a click.
-    assert long_polls[0] == 0
-    assert long_polls[1] == main.LONG_POLL_SECONDS
-
-
 def _polling(decisions: list[int], long_polls: list[int] | None = None):
     """A `telegram_updates.poll_once` stand-in replaying one ``decisions`` count per call."""
     remaining = list(decisions)
 
-    def _poll_once(offset: int | None = None, *, long_poll_seconds: int = 0) -> PollResult:
+    async def _poll_once(offset: int | None = None, *, long_poll_seconds: int = 0) -> PollResult:
         if long_polls is not None:
             long_polls.append(long_poll_seconds)
         count = remaining.pop(0) if remaining else 0
@@ -119,12 +79,133 @@ def _polling(decisions: list[int], long_polls: list[int] | None = None):
     return _poll_once
 
 
+def test_main_keeps_cycling_after_a_failed_run_and_stops_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    cycles: list[int] = []
+
+    async def _run_once() -> None:
+        cycles.append(len(cycles) + 1)
+        if len(cycles) == 2:
+            raise RuntimeError("the LLM provider exploded")
+
+    _quiet(monkeypatch, settings)
+    monkeypatch.setattr("app.main.telegram_updates.poll_once", _polling([]))
+    monkeypatch.setattr("app.pipeline.run_once", _run_once)
+    # The virtual clock ends the loop on the second inter-cycle wait, i.e. after two cycles.
+    clock = _Clock(stop_after_waits=2).install(monkeypatch)
+
+    main.main()  # returns normally instead of propagating the failure
+
+    assert cycles == [1, 2]
+    # When Telegram answers immediately there is nothing to wait for, so the update loop
+    # floors itself instead of spinning; every entry is that floor.
+    assert clock.slept
+    assert all(0 < seconds <= main.MIN_POLL_INTERVAL_SECONDS for seconds in clock.slept)
+
+
+def test_the_update_loop_long_polls_without_shortening_for_a_due_cycle(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    """With two tasks there is no reason to interrupt a long poll when a cycle is due.
+
+    Phase 5 asked for a zero-second poll whenever a cycle was pending, because the poll and
+    the cycle were the same thread; now the cycle simply proceeds.
+    """
+    long_polls: list[int] = []
+
+    _quiet(monkeypatch, settings)
+    monkeypatch.setattr("app.main.telegram_updates.poll_once", _polling([], long_polls))
+    monkeypatch.setattr("app.pipeline.run_once", _record([], "cycle"))
+    _Clock(stop_after_waits=1).install(monkeypatch)
+
+    main.main()
+
+    assert long_polls and set(long_polls) == {main.LONG_POLL_SECONDS}
+
+
+def test_a_decision_runs_the_approved_queue_without_a_new_cycle(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    """A click must be answered in seconds, not after `POLL_INTERVAL_SECONDS`."""
+    slow_cycles = settings.model_copy(update={"poll_interval_seconds": 3600})
+    processed: list[str] = []
+    answers = [True]
+
+    async def _wait_for_decision(_decision: asyncio.Event, _timeout: float) -> bool:
+        await asyncio.sleep(0)
+        if not answers:
+            raise KeyboardInterrupt
+        return answers.pop(0)
+
+    _quiet(monkeypatch, slow_cycles)
+    monkeypatch.setattr("app.main.telegram_updates.poll_once", _polling([1]))
+    monkeypatch.setattr("app.pipeline.run_once", _record(processed, "cycle"))
+    monkeypatch.setattr(
+        "app.pipeline.process_approved_posts", _record(processed, "decision")
+    )
+    _Clock(stop_after_waits=1).install(monkeypatch)
+    monkeypatch.setattr("app.main._wait_for_decision", _wait_for_decision)
+
+    main.main()
+
+    # The click is served right after the cycle that was in progress, not
+    # POLL_INTERVAL_SECONDS (3600s) later; the extra cycle is the loop going round again.
+    assert processed[:2] == ["cycle", "decision"]
+
+
+def _record(target: list[str], value: str):
+    """An awaitable stand-in that records one step (``run_once`` is async since phase 6)."""
+
+    async def _step() -> None:
+        target.append(value)
+
+    return _step
+
+
+def test_a_press_is_handled_while_a_cycle_is_still_running(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    """The reason for two tasks: a long cycle no longer delays the admin (phase 6).
+
+    The cycle blocks until the update loop has seen the press, which is exactly the
+    situation the old single-threaded loop could not express — there, the poll could not run
+    at all until `run_once()` returned, and this test would hang.
+    """
+    events: list[str] = []
+    cycle_running = asyncio.Event()
+    pressed = asyncio.Event()
+
+    async def _slow_cycle() -> None:
+        events.append("cycle-started")
+        cycle_running.set()
+        await pressed.wait()  # the cycle stays busy until the press has been seen
+        events.append("cycle-finished")
+
+    async def _poll_once(offset: int | None = None, **_kwargs: Any) -> PollResult:
+        await cycle_running.wait()  # do not "arrive" before the cycle really started
+        events.append("poll")
+        pressed.set()
+        return PollResult(offset=1, decisions=1)
+
+    _quiet(monkeypatch, settings)
+    monkeypatch.setattr("app.main.telegram_updates.poll_once", _poll_once)
+    monkeypatch.setattr("app.pipeline.run_once", _slow_cycle)
+    _Clock(stop_after_waits=1).install(monkeypatch)
+
+    main.main()
+
+    # The press is seen while the cycle is still busy (the extra "poll" is the update loop
+    # going round again after the cycle ended, which is what it is supposed to do).
+    assert events[:3] == ["cycle-started", "poll", "cycle-finished"]
+
+
 def test_run_safely_logs_and_swallows_a_failing_step(caplog) -> None:
-    def _boom() -> None:
+    async def _boom() -> None:
         raise RuntimeError("boom")
 
     with caplog.at_level(logging.ERROR):
-        main._run_safely(_boom)  # must not raise: the loop owns the retry
+        run(main._run_safely(_boom))  # must not raise: the loop owns the retry
 
     assert "boom" in caplog.text
 
@@ -132,7 +213,10 @@ def test_run_safely_logs_and_swallows_a_failing_step(caplog) -> None:
 def test_run_safely_reports_a_successful_step(caplog) -> None:
     called: list[str] = []
 
-    main._run_safely(lambda: called.append("ok"))
+    async def _ok() -> None:
+        called.append("ok")
+
+    run(main._run_safely(_ok))
 
     assert called == ["ok"]
     assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
@@ -202,7 +286,7 @@ def test_main_refuses_to_start_instead_of_looping_on_a_broken_schema(
     cycles: list[str] = []
     _quiet(monkeypatch, settings)
     monkeypatch.setattr("app.main.preflight", _raise_schema_error)
-    monkeypatch.setattr("app.pipeline.run_once", lambda: cycles.append("cycle"))
+    monkeypatch.setattr("app.pipeline.run_once", _record(cycles, "cycle"))
 
     with pytest.raises(SystemExit):
         main.main()

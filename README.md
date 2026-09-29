@@ -181,7 +181,7 @@ docker compose exec db psql -U postgres -d reddit_digest \
 برای هر پست تازه **یک پیام مستقل** در `TELEGRAM_REVIEW_CHANNEL_ID` می‌رسد (هیچ پیام تجمیعی):
 
 ```
-🆕 پست جدید برای بررسی
+🆕 پست جدید برای بررسی — 🆔 <code>{id}</code>
 
 📌 <b>Reddit’s new rate limits and what they mean</b>
 r/networking • شبکه • 🆔 42
