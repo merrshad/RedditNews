@@ -1,4 +1,4 @@
-"""FR-1 tests: topics config, RSS parsing (pure) and fetch resilience (NFR-2)."""
+"""FR-1 tests: the per-source batch cap, RSS parsing (pure) and fetch resilience (NFR-2)."""
 
 from __future__ import annotations
 
@@ -11,19 +11,17 @@ from typing import Any
 import httpx
 import pytest
 
+from app.models import SourceRecord, TopicRecord
 from app.reddit_source import (
-    DEFAULT_TOPICS_PATH,
     MAX_RETRY_AFTER_SECONDS,
     FeedError,
-    TopicConfig,
-    TopicsConfig,
     fetch_all,
     fetch_feed,
-    load_topics_config,
     parse_entry,
     parse_feed,
     strip_html,
     subreddit_from_feed_url,
+    topic_display_names,
 )
 from app.retry import PermanentError
 
@@ -77,74 +75,111 @@ def sample_feed() -> bytes:
     return SAMPLE_FEED.encode("utf-8")
 
 
-def _topics_config(*, feeds: dict[str, list[str]]) -> TopicsConfig:
-    return TopicsConfig(
-        topics=[TopicConfig(key=key, name=key, feeds=urls) for key, urls in feeds.items()]
+def _sources(
+    *, feeds: dict[str, list[str]], fetch_limit: int | None = None
+) -> list[SourceRecord]:
+    """The rows ``repository.list_sources`` would hand the collector (FR-1)."""
+    return [
+        SourceRecord(topic_key=key, rss_url=url, fetch_limit=fetch_limit)
+        for key, urls in feeds.items()
+        for url in urls
+    ]
+
+
+def _feed_with(ids: list[str]) -> bytes:
+    """A minimal Atom document holding one entry per id, newest-first as Reddit sends it."""
+    entries = "".join(
+        f"<entry><id>{entry_id}</id><title>{entry_id}</title>"
+        f"<link href=\"https://example.com/{entry_id}\" /></entry>"
+        for entry_id in ids
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom">' + entries + "</feed>"
+    ).encode("utf-8")
+
+
+# --- the batch cap is configuration, not a constant (FR-1) ------------------------
+
+
+def test_topic_display_names_maps_keys_to_persian_names() -> None:
+    """Invariant 5: the message shows «هوش مصنوعی», never the raw key."""
+    names = topic_display_names(
+        [TopicRecord(key="ai", name="هوش مصنوعی"), TopicRecord(key="startup", name="استارتاپ")]
     )
 
+    assert names == {"ai": "هوش مصنوعی", "startup": "استارتاپ"}
 
-# --- load_topics_config -----------------------------------------------------------
 
+def test_the_default_cap_limits_how_many_items_one_source_yields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`min(configured_limit, available)`: 3 items available, cap 2 -> 2 items."""
+    document = _feed_with(["t3_one", "t3_two", "t3_three"])
+    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: document)
 
-def test_load_topics_config_reads_topics_and_feeds(tmp_path) -> None:
-    path = tmp_path / "topics.yaml"
-    path.write_text(
-        """
-topics:
-  - key: ai
-    name: "هوش مصنوعی"
-    feeds:
-      - "https://example.com/ai.rss"
-      - "https://example.com/ml.rss"
-  - key: startup
-    name: "استارتاپ"
-    feeds:
-      - "https://example.com/startups.rss"
-""",
-        encoding="utf-8",
+    posts = fetch_all(
+        _sources(feeds={"ai": ["https://a.example/feed.rss"]}), default_fetch_limit=2
     )
 
-    config = load_topics_config(path)
-
-    assert [topic.key for topic in config.topics] == ["ai", "startup"]
-    assert config.topics[0].name == "هوش مصنوعی"
-    assert config.topics[0].feeds == ["https://example.com/ai.rss", "https://example.com/ml.rss"]
+    assert [post.reddit_id for post in posts] == ["t3_one", "t3_two"]
 
 
-def test_load_topics_config_rejects_duplicate_keys(tmp_path) -> None:
-    path = tmp_path / "topics.yaml"
-    path.write_text(
-        """
-topics:
-  - key: ai
-    name: "هوش مصنوعی"
-    feeds: ["https://example.com/a.rss"]
-  - key: ai
-    name: "dup"
-    feeds: ["https://example.com/b.rss"]
-""",
-        encoding="utf-8",
+def test_a_cap_larger_than_the_feed_keeps_every_available_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configured 50 with a 3-item document yields 3: nothing is invented or dropped."""
+    document = _feed_with(["t3_one", "t3_two", "t3_three"])
+    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: document)
+
+    posts = fetch_all(
+        _sources(feeds={"ai": ["https://a.example/feed.rss"]}, fetch_limit=50),
+        default_fetch_limit=50,
     )
 
-    with pytest.raises(ValueError, match="duplicate topic keys"):
-        load_topics_config(path)
+    assert len(posts) == 3
 
 
-def test_load_topics_config_rejects_an_empty_topic_list(tmp_path) -> None:
-    path = tmp_path / "topics.yaml"
-    path.write_text("topics: []\n", encoding="utf-8")
+def test_a_source_cap_overrides_the_global_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = _feed_with(["t3_one", "t3_two", "t3_three"])
+    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: document)
 
-    with pytest.raises(ValueError, match="at least one topic"):
-        load_topics_config(path)
+    posts = fetch_all(
+        _sources(feeds={"ai": ["https://a.example/feed.rss"]}, fetch_limit=1),
+        default_fetch_limit=25,
+    )
+
+    assert [post.reddit_id for post in posts] == ["t3_one"]
 
 
-def test_load_topics_config_reads_the_shipped_default_config() -> None:
-    """The YAML we ship must parse and give every topic at least one feed (section 11)."""
-    config = load_topics_config()
+def test_each_source_is_capped_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two feeds in one run keep their own caps (the reason the field is per source)."""
+    documents = {
+        "https://a.example/feed.rss": _feed_with(["t3_a1", "t3_a2", "t3_a3"]),
+        "https://b.example/feed.rss": _feed_with(["t3_b1", "t3_b2", "t3_b3"]),
+    }
+    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: documents[feed_url])
+    sources = [
+        SourceRecord(topic_key="ai", rss_url="https://a.example/feed.rss", fetch_limit=1),
+        SourceRecord(topic_key="startup", rss_url="https://b.example/feed.rss", fetch_limit=3),
+    ]
 
-    assert DEFAULT_TOPICS_PATH.is_file()
-    assert config.topics
-    assert all(topic.feeds for topic in config.topics)
+    posts = fetch_all(sources, default_fetch_limit=25)
+
+    assert [post.reddit_id for post in posts] == ["t3_a1", "t3_b1", "t3_b2", "t3_b3"]
+    assert {post.source_topic_key for post in posts} == {"ai", "startup"}
+
+
+def test_a_source_without_its_own_cap_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = _feed_with(["t3_one", "t3_two", "t3_three"])
+    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: document)
+    sources = _sources(feeds={"ai": ["https://a.example/feed.rss"]})  # fetch_limit=None
+
+    posts = fetch_all(sources, default_fetch_limit=1)
+
+    assert [post.reddit_id for post in posts] == ["t3_one"]
 
 
 # --- parsing (pure, FR-1) ---------------------------------------------------------
@@ -164,11 +199,11 @@ def test_parse_entry_falls_back_to_the_updated_date() -> None:
 
     (post,) = parse_feed(document, source_topic_key="ai")
 
-    assert post.published_at == datetime(2026, 9, 27, 11, 30, tzinfo=timezone.utc)
+    assert post.posted_at == datetime(2026, 9, 27, 11, 30, tzinfo=timezone.utc)
 
 
 def test_parse_entry_without_any_date_still_parses() -> None:
-    """FR-1: a missing date is not a reason to drop a post (``published_at`` is nullable).
+    """FR-1: a missing date is not a reason to drop a post (``posted_at`` is nullable).
 
     The column is nullable on purpose and ``fetch_recent_candidates`` falls back to
     ``fetched_at``, so the post is stored and analyses normally; only the recency window
@@ -187,7 +222,7 @@ def test_parse_entry_without_any_date_still_parses() -> None:
     (post,) = parse_feed(document, source_topic_key="ai")
 
     assert post.reddit_id == "t3_nodate"
-    assert post.published_at is None
+    assert post.posted_at is None
     assert post.title == "No date at all"
     assert post.subreddit == "unknown"  # no r/<name> tag and no feed URL to fall back to
 
@@ -204,7 +239,7 @@ def test_parse_feed_maps_every_required_field(sample_feed: bytes) -> None:
     assert first.url.endswith("/comments/1abcde/a_new_open_model/")
     assert first.author == "somebody"
     assert first.raw_content == "Full html body & more"
-    assert first.published_at == datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
+    assert first.posted_at == datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc)
 
 
 def test_parse_feed_falls_back_to_summary_content(sample_feed: bytes) -> None:
@@ -212,7 +247,7 @@ def test_parse_feed_falls_back_to_summary_content(sample_feed: bytes) -> None:
 
     second = posts[1]
     assert second.raw_content == "summary text"
-    assert second.published_at is None
+    assert second.posted_at is None
 
 
 def test_parse_feed_reads_rss2_guid_and_description() -> None:
@@ -224,7 +259,7 @@ def test_parse_feed_reads_rss2_guid_and_description() -> None:
     assert post.title == "How we launched"
     assert post.raw_content == "body & notes"
     assert post.source_topic_key == "startup"
-    assert post.published_at == datetime(2026, 9, 27, 9, 0, tzinfo=timezone.utc)
+    assert post.posted_at == datetime(2026, 9, 27, 9, 0, tzinfo=timezone.utc)
 
 
 def test_parse_feed_skips_unusable_entries() -> None:
@@ -439,7 +474,7 @@ def test_fetch_all_skips_a_timed_out_feed_and_parses_the_rest(
     monkeypatch: pytest.MonkeyPatch, sample_feed: bytes
 ) -> None:
     """Invariant 8: one unresponsive feed must never stop the other feeds."""
-    config = _topics_config(
+    sources = _sources(
         feeds={"ai": ["https://slow.example/feed.rss"], "startup": ["https://ok.example/feed.rss"]}
     )
 
@@ -450,7 +485,7 @@ def test_fetch_all_skips_a_timed_out_feed_and_parses_the_rest(
 
     monkeypatch.setattr("app.reddit_source.fetch_feed", fake_fetch_feed)
 
-    posts = fetch_all(config)
+    posts = fetch_all(sources, default_fetch_limit=25)
 
     assert [post.reddit_id for post in posts] == ["t3_1abcde", "t3_2fghij"]
     assert {post.source_topic_key for post in posts} == {"startup"}
@@ -462,12 +497,12 @@ def test_fetch_all_skips_a_timed_out_feed_and_parses_the_rest(
 def test_fetch_all_maps_every_feed_to_its_topic(
     monkeypatch: pytest.MonkeyPatch, sample_feed: bytes
 ) -> None:
-    config = _topics_config(
+    sources = _sources(
         feeds={"ai": ["https://a.example/feed.rss"], "startup": ["https://b.example/feed.rss"]}
     )
     monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: sample_feed)
 
-    posts = fetch_all(config)
+    posts = fetch_all(sources, default_fetch_limit=25)
 
     # Two feeds with the same document: the second one is dropped as a duplicate.
     assert [post.reddit_id for post in posts] == ["t3_1abcde", "t3_2fghij"]
@@ -477,7 +512,7 @@ def test_fetch_all_maps_every_feed_to_its_topic(
 def test_fetch_all_keeps_going_when_a_feed_fails(
     monkeypatch: pytest.MonkeyPatch, sample_feed: bytes
 ) -> None:
-    config = _topics_config(
+    sources = _sources(
         feeds={"ai": ["https://good.example/feed.rss"], "startup": ["https://bad.example/feed.rss"]}
     )
 
@@ -488,14 +523,14 @@ def test_fetch_all_keeps_going_when_a_feed_fails(
 
     monkeypatch.setattr("app.reddit_source.fetch_feed", fake_fetch_feed)
 
-    posts = fetch_all(config)
+    posts = fetch_all(sources, default_fetch_limit=25)
 
     assert [post.reddit_id for post in posts] == ["t3_1abcde", "t3_2fghij"]
     assert all(post.source_topic_key == "ai" for post in posts)
 
 
-def test_fetch_all_reads_every_feed_of_a_topic(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = _topics_config(
+def test_fetch_all_reads_every_source_of_a_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    sources = _sources(
         feeds={"ai": ["https://a.example/feed.rss", "https://b.example/feed.rss"]}
     )
     seen: list[str] = []
@@ -506,12 +541,12 @@ def test_fetch_all_reads_every_feed_of_a_topic(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("app.reddit_source.fetch_feed", fake_fetch_feed)
 
-    posts = fetch_all(config)
+    posts = fetch_all(sources, default_fetch_limit=25)
 
     assert seen == ["https://a.example/feed.rss", "https://b.example/feed.rss"]
     assert [post.reddit_id for post in posts] == ["t3_a", "t3_b"]
     assert {post.source_topic_key for post in posts} == {"ai"}
 
 
-def test_fetch_all_returns_nothing_for_a_config_without_feeds() -> None:
-    assert fetch_all(TopicsConfig(topics=[TopicConfig(key="ai", name="هوش مصنوعی")])) == []
+def test_fetch_all_returns_nothing_when_no_source_is_configured() -> None:
+    assert fetch_all([], default_fetch_limit=25) == []

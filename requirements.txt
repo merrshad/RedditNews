@@ -5,7 +5,6 @@ openai~=1.54
 pydantic~=2.9
 pydantic-settings~=2.6
 httpx~=0.27
-PyYAML~=6.0
 
 # Test dependencies (AGENTS.md section 13 runs `pytest` after installing this file)
 pytest~=8.3

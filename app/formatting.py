@@ -101,9 +101,9 @@ def _render(post: PostRecord, topic_name: str | None, summary: str) -> str:
 def format_message(post: PostRecord, *, topic_name: str | None = None) -> str:
     """Render the Persian Telegram message for one stored post (FR-10).
 
-    ``topic_name`` is the Persian display name resolved from ``config/topics.yaml``
-    (``pipeline`` already has the mapping); when a caller has none, the stored topic key
-    is shown instead of a raw English key leaking into the message. The layout:
+    ``topic_name`` is the Persian display name of the topic row (``pipeline`` resolves it
+    from the enabled ``topics``); when a caller has none, the stored topic key is shown
+    instead of a raw English key leaking into the message. The layout:
 
         📌 <b>{title}</b>
         r/{subreddit} • {topic} • اهمیت: {importance_fa}

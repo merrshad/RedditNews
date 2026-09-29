@@ -3,9 +3,10 @@
 The document is the source of truth for this project (AGENTS.md, section 14), but nothing
 used to check that it *kept* being true: a new module, a new env var, a new status or a
 renamed column could land while the document quietly rotted. These tests read the real
-artefacts — the file tree, `app.settings.Settings`, `app.models.PostStatus`, `db/schema.sql`
-and `config/topics.yaml` — and compare them with sections 9, 10 and 11 of AGENTS.md, so a
-mismatch fails the suite instead of waiting for the next audit.
+artefacts — the file tree, `app.settings.Settings`, `app.models.PostStatus`/`ReviewStatus`,
+`db/schema.sql` (columns *and* the seeded taxonomy) and `.env.example` — and compare them
+with sections 9, 10 and 11 of AGENTS.md, so a mismatch fails the suite instead of waiting
+for the next audit.
 
 They are deliberately about *structure* (names, sets, columns), not prose: wording stays
 free, but the contract between the document and the code does not.
@@ -25,10 +26,11 @@ from app import (
     pipeline,
     reddit_source,
     repository,
+    review,
     telegram_notifier,
+    telegram_updates,
 )
-from app.models import PostStatus
-from app.reddit_source import DEFAULT_TOPICS_PATH, load_topics_config
+from app.models import PostStatus, ReviewStatus
 from app.settings import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -79,10 +81,10 @@ def _code_python_files() -> set[str]:
     }
 
 
-def _create_table_block(sql: str) -> str:
-    """The body of `CREATE TABLE IF NOT EXISTS posts ( ... );`."""
-    match = re.search(r"CREATE TABLE IF NOT EXISTS posts \((.*?)\n\);", sql, re.DOTALL)
-    assert match, "the posts table was not found"
+def _create_table_block(sql: str, table: str) -> str:
+    """The body of `CREATE TABLE IF NOT EXISTS <table> ( ... );`."""
+    match = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", sql, re.DOTALL)
+    assert match, f"the {table} table was not found"
     return match.group(1)
 
 
@@ -91,15 +93,28 @@ def _column_names(create_table_body: str) -> set[str]:
     return set(re.findall(r"^\s{4}([a-z_][a-z0-9_]*)\s", create_table_body, re.MULTILINE))
 
 
-def _statuses_in(sql: str) -> set[str]:
-    """The values listed in the `status ... CHECK (status IN (...))` constraint."""
-    match = re.search(r"status IN \((.*?)\)", sql, re.DOTALL)
-    assert match, "no status CHECK constraint found"
+def _checked_values(sql: str, column: str) -> set[str]:
+    """The values of one `CHECK (<column> IN (...))` constraint, wherever it appears."""
+    match = re.search(rf"CHECK \({column} IN \((.*?)\)", sql, re.DOTALL)
+    assert match, f"no CHECK constraint for {column} found"
     return set(re.findall(r"'([a-z_]+)'", match.group(1)))
 
 
 def _documented_env_vars() -> set[str]:
     return set(re.findall(r"^\| `([A-Z_]+)` \|", _section("config"), re.MULTILINE))
+
+
+def _seeded_taxonomy(sql: str) -> tuple[set[str], set[str]]:
+    """The topic keys and feed URLs `db/schema.sql` seeds on a fresh database."""
+    topics_block = re.search(
+        r"INSERT INTO topics.*?ON CONFLICT", sql, re.DOTALL
+    )
+    sources_block = re.search(r"INSERT INTO sources.*?ON CONFLICT", sql, re.DOTALL)
+    assert topics_block and sources_block, "the taxonomy seed was not found in db/schema.sql"
+
+    keys = set(re.findall(r"\('([a-z0-9_-]+)',", topics_block.group(0)))
+    urls = set(re.findall(r"'(https://[^']+)'", sources_block.group(0)))
+    return keys, urls
 
 
 # --- section 9: the file tree ------------------------------------------------------
@@ -119,21 +134,41 @@ def test_the_prompt_template_is_documented() -> None:
     assert (PROJECT_ROOT / "app" / "prompts" / "analysis_prompt.md").is_file()
 
 
+def test_the_config_directory_is_gone() -> None:
+    """Topics and sources are data now (phase 5): no YAML file may come back."""
+    assert "topics.yaml" not in _section("structure")
+    assert not (PROJECT_ROOT / "config").exists()
+
+
 @pytest.mark.parametrize(
     ("module", "attribute"),
     [
-        (reddit_source, "load_topics_config"),
         (reddit_source, "fetch_all"),
         (reddit_source, "topic_display_names"),
+        (repository, "list_topics"),
+        (repository, "list_sources"),
         (repository, "exists"),
         (repository, "save"),
-        (repository, "update_status"),
-        (repository, "fetch_recent_candidates"),
+        (repository, "fetch_new_reviews"),
+        (repository, "mark_review_dispatched"),
+        (repository, "decide_review"),
+        (repository, "fetch_approved_for_analysis"),
+        (repository, "record_analysis"),
         (repository, "fetch_pending_to_send"),
+        (repository, "claim_for_publish"),
+        (repository, "mark_published"),
+        (repository, "fetch_recent_candidates"),
         (analyzer, "analyze"),
         (telegram_notifier, "send_message"),
+        (telegram_notifier, "edit_message_text"),
+        (telegram_notifier, "answer_callback_query"),
+        (telegram_notifier, "get_updates"),
+        (review, "dispatch_pending_reviews"),
+        (review, "handle_callback"),
+        (telegram_updates, "poll_once"),
         (formatting, "format_message"),
         (pipeline, "run_once"),
+        (pipeline, "process_approved_posts"),
         (pipeline, "retry_pending_sends"),
     ],
 )
@@ -146,30 +181,44 @@ def test_the_apis_named_in_section_9_are_the_real_ones(module: object, attribute
 # --- section 10: the schema --------------------------------------------------------
 
 
-def test_the_posts_columns_are_documented_exactly() -> None:
-    real = _column_names(_create_table_block(SCHEMA_PATH.read_text(encoding="utf-8")))
-    documented = _column_names(_create_table_block(_fenced_block(_section("schema"), "sql")))
+@pytest.mark.parametrize("table", ["topics", "sources", "posts"])
+def test_the_table_columns_are_documented_exactly(table: str) -> None:
+    real = _column_names(_create_table_block(SCHEMA_PATH.read_text(encoding="utf-8"), table))
+    documented = _column_names(
+        _create_table_block(_fenced_block(_section("schema"), "sql"), table)
+    )
 
     assert documented == real
-    assert len(real) == 20  # guards against the regex silently matching nothing
+    assert real, f"the {table} regex matched nothing"
 
 
-def test_the_documented_statuses_are_the_real_ones() -> None:
-    """`PostStatus` (code), `db/schema.sql` (database) and section 10 (doc) must agree."""
-    real = set(get_args(PostStatus))
-    schema = _statuses_in(SCHEMA_PATH.read_text(encoding="utf-8"))
-    documented = _statuses_in(_fenced_block(_section("schema"), "sql"))
+def test_the_posts_columns_count_is_guarded() -> None:
+    """A canary for the regex above: the review/audit columns are really there."""
+    real = _column_names(_create_table_block(SCHEMA_PATH.read_text(encoding="utf-8"), "posts"))
+
+    assert len(real) == 31
+
+
+@pytest.mark.parametrize(
+    ("column", "literal"),
+    [("status", PostStatus), ("review_status", ReviewStatus)],
+)
+def test_the_documented_states_are_the_real_ones(column: str, literal: object) -> None:
+    """The literal (code), `db/schema.sql` (database) and section 10 (doc) must agree."""
+    real = set(get_args(literal))
+    schema = _checked_values(SCHEMA_PATH.read_text(encoding="utf-8"), column)
+    documented = _checked_values(_fenced_block(_section("schema"), "sql"), column)
 
     assert schema == real
     assert documented == real
 
 
 def test_the_documented_indexes_are_the_real_ones() -> None:
-    documented = set(re.findall(r"idx_posts_[a-z_]+", _fenced_block(_section("schema"), "sql")))
-    real = set(re.findall(r"idx_posts_[a-z_]+", SCHEMA_PATH.read_text(encoding="utf-8")))
+    documented = set(re.findall(r"idx_[a-z_]+", _fenced_block(_section("schema"), "sql")))
+    real = set(re.findall(r"idx_[a-z_]+", SCHEMA_PATH.read_text(encoding="utf-8")))
 
     assert documented == real
-    assert documented  # the regex really found the two indexes
+    assert documented  # the regex really found the indexes
 
 
 # --- section 11: configuration -----------------------------------------------------
@@ -197,19 +246,18 @@ def test_the_env_example_matches_the_documented_variables() -> None:
     ), "every non-comment line of .env.example must be a KEY=value pair"
 
 
-def test_the_documented_topic_list_is_the_shipped_one() -> None:
-    """Section 11 shows `config/topics.yaml`; the example must not be a stale sample."""
-    block = _fenced_block(_section("config"), "yaml")
-    documented_keys = set(re.findall(r"key: ([a-z0-9_-]+)", block))
-    documented_feeds = set(re.findall(r'"(https://[^"]+)"', block))
+def test_the_seeded_taxonomy_is_the_documented_one() -> None:
+    """Section 11 shows the starting topics/feeds; the database seed must not drift."""
+    topics_block = _fenced_block(_section("config"), "sql")
+    documented_keys = set(re.findall(r"\('([a-z0-9_-]+)',", topics_block))
+    documented_urls = set(re.findall(r"'(https://[^']+)'", topics_block))
 
-    real = load_topics_config(DEFAULT_TOPICS_PATH)
-    real_keys = {topic.key for topic in real.topics}
-    real_feeds = {feed for topic in real.topics for feed in topic.feeds}
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    real_keys, real_urls = _seeded_taxonomy(schema)
 
-    assert real_keys  # the shipped file is not empty
+    assert real_keys and real_urls  # the shipped seed is not empty
     assert documented_keys == real_keys
-    assert documented_feeds == real_feeds
+    assert documented_urls == real_urls
 
 
 @pytest.mark.parametrize("header", list(SECTION_HEADERS.values()))

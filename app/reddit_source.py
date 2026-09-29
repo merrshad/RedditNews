@@ -1,7 +1,12 @@
 """RSS fetching and parsing for the configured Reddit feeds (FR-1).
 
-This module owns ``config/topics.yaml`` — the list of allowed topics and their feeds
-(NFR-7) — plus everything that turns a feed document into a :class:`RawPost`.
+This module owns everything that turns a feed document into a :class:`RawPost`, and
+nothing else: feeds, their topic and their batch cap are *data* now (``sources`` in
+Postgres, managed by the admin), so the caller passes :class:`SourceRecord` rows in.
+
+The batch cap is ``min(source.fetch_limit or default_fetch_limit, available items)``:
+a source set to 50 whose document holds 17 items yields 17, and the number 25 is only
+ever the configured default (``RSS_FETCH_LIMIT``), never a property of the code.
 """
 
 from __future__ import annotations
@@ -12,15 +17,12 @@ import re
 import time
 from datetime import datetime, timezone
 from html import unescape
-from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import feedparser
 import httpx
-import yaml
-from pydantic import BaseModel, Field, model_validator
 
-from app.models import RawPost
+from app.models import RawPost, SourceRecord, TopicRecord
 from app.retry import PermanentError, retryable
 
 logger = logging.getLogger(__name__)
@@ -36,9 +38,6 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 RATE_LIMIT_STATUS = 429
 MAX_RETRY_AFTER_SECONDS = 30.0
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TOPICS_PATH = PROJECT_ROOT / "config" / "topics.yaml"
-
 _TAG_RE = re.compile(r"<[^>]+>")
 _INLINE_SPACE_RE = re.compile(r"[ \t]+")
 _SUBREDDIT_IN_URL_RE = re.compile(r"/r/([^/]+)/", re.IGNORECASE)
@@ -49,42 +48,8 @@ class FeedError(RuntimeError):
     """Raised when a feed cannot be fetched or parsed."""
 
 
-class TopicConfig(BaseModel):
-    """One allowed topic and the RSS feeds that feed it (NFR-7)."""
-
-    key: str
-    name: str
-    feeds: list[str] = Field(default_factory=list)
-
-
-class TopicsConfig(BaseModel):
-    """The whole ``config/topics.yaml`` document."""
-
-    topics: list[TopicConfig]
-
-    @model_validator(mode="after")
-    def _check_topics(self) -> "TopicsConfig":
-        keys = [topic.key for topic in self.topics]
-        if not keys:
-            raise ValueError("config/topics.yaml must define at least one topic")
-        if len(keys) != len(set(keys)):
-            raise ValueError("duplicate topic keys in config/topics.yaml")
-        return self
-
-
-def load_topics_config(path: str | Path = DEFAULT_TOPICS_PATH) -> TopicsConfig:
-    """Read the allowed topics and their feeds (FR-1, FR-5, NFR-7).
-
-    The default points at ``config/topics.yaml`` inside the project root, so the
-    worker does not depend on its current working directory.
-    """
-    with Path(path).open(encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    return TopicsConfig.model_validate(raw)
-
-
-def topic_display_names(topics: Sequence[TopicConfig]) -> dict[str, str]:
-    """Map topic key -> Persian display name for Telegram messages (FR-10)."""
+def topic_display_names(topics: Sequence[TopicRecord]) -> dict[str, str]:
+    """Map topic key -> Persian display name for the Telegram messages (FR-10, Invariant 5)."""
     return {topic.key: topic.name for topic in topics}
 
 
@@ -120,7 +85,7 @@ def _reddit_id_from_entry(entry: Any) -> str | None:
     return f"t3_{match.group(1)}" if match else None
 
 
-def _published_at_from_entry(entry: Any) -> datetime | None:
+def _posted_at_from_entry(entry: Any) -> datetime | None:
     for field in ("published_parsed", "updated_parsed"):
         struct_time = entry.get(field)
         if struct_time:
@@ -173,7 +138,7 @@ def parse_entry(entry: Any, *, source_topic_key: str, feed_url: str = "") -> Raw
         url=url,
         author=_author_from_entry(entry),
         raw_content=_raw_content_from_entry(entry),
-        published_at=_published_at_from_entry(entry),
+        posted_at=_posted_at_from_entry(entry),
     )
 
 
@@ -242,36 +207,53 @@ def fetch_feed(feed_url: str) -> bytes:
     return response.content
 
 
-def fetch_all(topics_config: TopicsConfig) -> list[RawPost]:
-    """Fetch and parse every feed of every configured topic (FR-1).
+def fetch_source(source: SourceRecord, *, default_fetch_limit: int) -> list[RawPost]:
+    """Fetch and parse one source, capped at its own (or the global) limit (FR-1).
 
-    A feed that is still failing after its retries is logged and skipped, so one dead
-    feed can never stop the run (NFR-2 / Invariant 8). Items are de-duplicated by
-    ``reddit_id`` within the batch, keeping the first occurrence (Invariant 1).
+    Returns ``[]`` when the feed is unreachable or unparsable: one dead feed must never
+    stop the run (NFR-2 / Invariant 8). Reddit's documents are newest-first, so the cap
+    keeps the newest items.
+    """
+    limit = source.fetch_limit or default_fetch_limit
+    try:
+        content = fetch_feed(source.rss_url)
+        parsed_posts = parse_feed(
+            content, source_topic_key=source.topic_key, feed_url=source.rss_url
+        )
+    except Exception as exc:  # NFR-2: a bad feed must not stop the run
+        logger.error("Skipping feed %s after failure: %s", source.rss_url, exc)
+        return []
+
+    kept = parsed_posts[:limit]
+    logger.info(
+        "Feed %s parsed: %d item(s), %d kept (limit %d)",
+        source.rss_url,
+        len(parsed_posts),
+        len(kept),
+        limit,
+    )
+    return kept
+
+
+def fetch_all(
+    sources: Sequence[SourceRecord], *, default_fetch_limit: int
+) -> list[RawPost]:
+    """Fetch and parse every configured source (FR-1).
+
+    Items are de-duplicated by ``reddit_id`` within the batch, keeping the first
+    occurrence (Invariant 1): the same post can legitimately appear in two feeds (a
+    subreddit and a cross-post), and the exact duplicate check in the database can only
+    see what was stored before this run.
     """
     posts: list[RawPost] = []
     seen: set[str] = set()
 
-    for topic in topics_config.topics:
-        for feed_url in topic.feeds:
-            try:
-                content = fetch_feed(feed_url)
-                parsed_posts = parse_feed(
-                    content, source_topic_key=topic.key, feed_url=feed_url
-                )
-            except Exception as exc:  # NFR-2: a bad feed must not stop the run
-                logger.error("Skipping feed %s after failure: %s", feed_url, exc)
+    for source in sources:
+        for post in fetch_source(source, default_fetch_limit=default_fetch_limit):
+            if post.reddit_id in seen:
                 continue
-
-            new_posts = [post for post in parsed_posts if post.reddit_id not in seen]
-            seen.update(post.reddit_id for post in new_posts)
-            posts.extend(new_posts)
-            logger.info(
-                "Feed %s parsed: %d item(s), %d new in this batch",
-                feed_url,
-                len(parsed_posts),
-                len(new_posts),
-            )
+            seen.add(post.reddit_id)
+            posts.append(post)
 
     logger.info("Fetched %d candidate post(s) in total", len(posts))
     return posts
