@@ -19,8 +19,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.llm_client import chat_completion
-from app.models import LlmAnalysis, PostRecord, RawPost
-from app.reddit_source import TopicConfig
+from app.models import LlmAnalysis, PostRecord, RawPost, TopicRecord
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +47,7 @@ def load_system_prompt(path: str | Path = DEFAULT_PROMPT_PATH) -> str:
 def build_user_prompt(
     post: RawPost,
     candidates: list[PostRecord],
-    allowed_topics: list[TopicConfig],
+    allowed_topics: list[TopicRecord],
 ) -> str:
     """Build the single user message: new post + local-indexed candidates + topics.
 
@@ -99,7 +98,7 @@ def _validate_schema(data: dict[str, Any]) -> LlmAnalysis:
 def _validate_against_context(
     analysis: LlmAnalysis,
     *,
-    allowed_topics: list[TopicConfig],
+    allowed_topics: list[TopicRecord],
     candidates: list[PostRecord],
     raw_response: dict[str, Any],
 ) -> None:
@@ -121,7 +120,7 @@ def _validate_against_context(
 def analyze(
     post: RawPost,
     candidates: list[PostRecord],
-    allowed_topics: list[TopicConfig],
+    allowed_topics: list[TopicRecord],
 ) -> LlmAnalysis:
     """Run the single analysis call for one post and return its validated result.
 

@@ -7,13 +7,12 @@ import json
 import pytest
 
 from app.analyzer import AnalysisError, analyze, build_user_prompt, load_system_prompt
-from app.models import LlmAnalysis, PostRecord, RawPost
-from app.reddit_source import TopicConfig
+from app.models import LlmAnalysis, PostRecord, RawPost, TopicRecord
 from tests.conftest import FakeChatCompletion
 
 ALLOWED_TOPICS = [
-    TopicConfig(key="ai", name="هوش مصنوعی"),
-    TopicConfig(key="startup", name="استارتاپ"),
+    TopicRecord(key="ai", name="هوش مصنوعی"),
+    TopicRecord(key="startup", name="استارتاپ"),
 ]
 
 VALID_ANSWER = {

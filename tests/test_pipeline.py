@@ -1,21 +1,22 @@
-"""Pipeline tests: ordering, status decisions, idempotency and error isolation.
+"""Pipeline tests: the review gate, the publication state machine and error isolation.
 
 The orchestration is exercised through its module-level entry points (`run_once`,
-`retry_pending_sends`) exactly as `app/main.py` uses them. RSS, the LLM transport and
-Telegram are faked (NFR-8); storage is either the in-memory fake or — for the recovery
-tests — the real Postgres through `db/schema.sql`.
+`process_approved_posts`, `retry_pending_sends`) exactly as `app/main.py` uses them.
+Storage is the **real Postgres** (the dedicated test database, see ``conftest``): the
+review/publication flow is a state machine expressed in conditional SQL, and a hand-written
+fake would test the fake instead of the machine. RSS, the LLM transport and Telegram are
+faked (NFR-8) — no test may touch the network or broadcast.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import psycopg
 import pytest
 
-from app import pipeline, repository
+from app import pipeline, repository, review
 from app.models import LlmAnalysis, PostRecord, RawPost
 from app.pipeline import (
     build_post_record,
@@ -23,140 +24,137 @@ from app.pipeline import (
     meets_importance_threshold,
     resolve_duplicate_id,
 )
-from app.reddit_source import TopicsConfig
 from app.settings import Settings
 from tests.conftest import (
     TEST_REDDIT_ID_PREFIX,
     FakeChatCompletion,
-    FakeRepository,
-    FakeSender,
-    FailingSender,
-    patch_repository,
+    FakeTelegram,
+    insert_source,
+    insert_topic,
+    patch_telegram,
+    temp_topic_key,
 )
 
-VALID_ANSWER = {
+TOPIC_KEY = temp_topic_key("ai")  # the key an approved answer must name (FR-5)
+TOPIC_NAME = "هوش مصنوعی"
+REVIEW_CHANNEL = "-100999"
+PUBLIC_CHANNEL = "-100123"
+ADMIN_ID = "777"
+
+VALID_ANSWER: dict[str, Any] = {
     "is_relevant": True,
     "duplicate_of_candidate_index": None,
-    "topic": "ai",
+    "topic": TOPIC_KEY,
     "importance": "high",
     "summary_fa": "خلاصه فارسی پست.",
     "key_points": ["نکته اول"],
 }
-VALID_JSON = json.dumps(VALID_ANSWER, ensure_ascii=False)
 
 
-def _post(reddit_id: str = "t3_1abcde", *, title: str = "A new open model was released") -> RawPost:
+def _answer(**overrides: Any) -> str:
+    return json.dumps({**VALID_ANSWER, **overrides}, ensure_ascii=False)
+
+
+def _post(slug: str = "new", *, title: str = "یک پست تازه") -> RawPost:
     return RawPost(
-        reddit_id=reddit_id,
-        subreddit="MachineLearning",
-        source_topic_key="ai",
+        reddit_id=f"{TEST_REDDIT_ID_PREFIX}{slug}",
+        subreddit="mlops",
+        source_topic_key=TOPIC_KEY,
         title=title,
-        url=f"https://www.reddit.com/r/MachineLearning/comments/{reddit_id}/x/",
+        url=f"https://www.reddit.com/r/mlops/comments/{slug}/x/",
         author="somebody",
-        raw_content="Body",
+        raw_content="متن خام پست",
     )
 
 
-def _candidate(post_id: int, reddit_id: str) -> PostRecord:
-    """An already-stored post, as `fetch_recent_candidates` would return it."""
-    return PostRecord(
-        id=post_id,
-        reddit_id=reddit_id,
-        subreddit="MachineLearning",
-        source_topic_key="ai",
-        title=reddit_id,
-        url=f"https://example.com/{reddit_id}",
-        summary_fa="خلاصه پست قبلی.",
-    )
+@pytest.fixture
+def taxonomy(db_connection: psycopg.Connection) -> psycopg.Connection:
+    """One topic plus one source, so a cycle has a taxonomy to read (FR-14)."""
+    insert_topic(db_connection, "ai", TOPIC_NAME)
+    insert_source(db_connection, "ai", "r/ai")
+    return db_connection
 
 
-def _pending(post_id: int = 5) -> PostRecord:
-    """A row an earlier run left behind as `to_send` (FR-11)."""
-    return PostRecord(
-        id=post_id,
-        reddit_id=f"t3_pending{post_id}",
-        subreddit="MachineLearning",
-        source_topic_key="ai",
-        title=f"Pending post {post_id}",
-        url=f"https://example.com/pending/{post_id}",
-        topic=None,
-        importance="medium",
-        summary_fa="خلاصه پست معلق.",
-        key_points=["نکته"],
-        status="to_send",
-    )
-
-
-def _raise_runtime_error(system_prompt: str, user_prompt: str) -> str:
-    """A ``chat_completion`` stand-in for the "the provider is down" path."""
-    raise RuntimeError("provider down")
-
-
-def _answering_by_title(answers: dict[str, str]) -> Callable[[str, str], str]:
-    """A ``chat_completion`` stand-in that answers per post, keyed by its title.
-
-    The title is part of the prompt payload, so this lets one run contain a post whose
-    answer is invalid while the next post is analysed normally.
-    """
-
-    def _completion(system_prompt: str, user_prompt: str) -> str:
-        for title, answer in answers.items():
-            if title in user_prompt:
-                return answer
-        raise AssertionError(f"prompt for an unexpected post: {user_prompt[:200]}")
-
-    return _completion
-
-
-def _patch_seams(
-    monkeypatch: pytest.MonkeyPatch,
+def _candidate(
+    connection: psycopg.Connection,
+    slug: str,
     *,
-    settings: Settings,
-    topics_config: TopicsConfig,
-    sender: Callable[[str], bool] | None = None,
-    llm: Callable[[str, str], str] | None = None,
-) -> tuple[FakeSender | Callable[[str], bool], Callable[[str, str], str]]:
-    """Replace the pipeline's collaborators with fakes (NFR-8: no network/Telegram).
+    summary: str = "خلاصه پست قبلی.",
+    minutes_ago: int = 60,
+) -> int:
+    """An already-analysed post in the database, i.e. what FR-4 offers the LLM as context.
 
-    The entry points take no arguments by design; tests therefore inject the settings, the
-    topics config and the notifier they want instead of letting the real ones be built.
+    ``posted_at`` is set explicitly so the candidate order the LLM sees is deterministic
+    (candidates are handed over newest first).
     """
-    llm = llm if llm is not None else FakeChatCompletion(VALID_JSON)
-    monkeypatch.setattr("app.analyzer.chat_completion", llm)
-    sender = sender if sender is not None else FakeSender()
-    monkeypatch.setattr("app.pipeline.send_message", sender)
-    monkeypatch.setattr("app.pipeline.get_settings", lambda: settings)
-    monkeypatch.setattr("app.pipeline.load_topics_config", lambda: topics_config)
-    return sender, llm
+    row = connection.execute(
+        """
+        INSERT INTO posts (
+            reddit_id, subreddit, source_topic_key, title, url, summary_fa, key_points,
+            is_relevant, topic, importance, posted_at, status, review_status
+        ) VALUES (%s, 'mlops', %s, %s, %s, %s, '["نکته"]'::jsonb, TRUE, %s, 'high',
+                  now() - make_interval(mins => %s), 'sent', 'approved')
+        RETURNING id
+        """,
+        (
+            f"{TEST_REDDIT_ID_PREFIX}{slug}",
+            TOPIC_KEY,
+            slug,
+            f"https://example.com/{slug}",
+            summary,
+            TOPIC_KEY,
+            minutes_ago,
+        ),
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
 
 
 def _harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
     settings: Settings,
-    topics_config: TopicsConfig,
-    repository: FakeRepository | None = None,
-    answer: str = VALID_JSON,
-    sender: FakeSender | None = None,
-    llm: Callable[[str, str], str] | None = None,
-) -> tuple[FakeRepository, FakeSender, Callable[[str, str], str]]:
-    """The pipeline wired to in-memory storage, a fake notifier and a stubbed LLM."""
-    if llm is None:
-        llm = FakeChatCompletion(answer)
-    sender, llm = _patch_seams(
-        monkeypatch, settings=settings, topics_config=topics_config, sender=sender, llm=llm
+    telegram: FakeTelegram | None = None,
+    llm: FakeChatCompletion | None = None,
+    posts: list[RawPost] | None = None,
+) -> tuple[FakeChatCompletion, FakeTelegram]:
+    """Wire the real pipeline to the real database, faking only the three boundaries."""
+    llm = llm or FakeChatCompletion(_answer())
+    telegram = patch_telegram(
+        monkeypatch, telegram or FakeTelegram(), default_chat_id=settings.telegram_chat_id
     )
-    repository = patch_repository(monkeypatch, repository or FakeRepository())
-    return repository, sender, llm  # type: ignore[return-value]
+    monkeypatch.setattr("app.analyzer.chat_completion", llm)
+    monkeypatch.setattr("app.pipeline.get_settings", lambda: settings)
+    monkeypatch.setattr("app.pipeline.fetch_all", lambda *args, **kwargs: list(posts or []))
+    return llm, telegram
 
 
-@pytest.fixture(autouse=True)
-def _single_post_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """By default a run fetches exactly one post; tests may override this."""
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [_post()])
+def _row(connection: psycopg.Connection, reddit_id: str) -> dict[str, Any]:
+    row = connection.execute("SELECT * FROM posts WHERE reddit_id = %s", (reddit_id,)).fetchone()
+    assert row is not None, f"reddit_id={reddit_id} was not stored"
+    return row
 
 
-# --- pure decision helpers -------------------------------------------------------
+def _approve(post_id: int, *, user_id: str = ADMIN_ID, callback_id: str = "cb-approve") -> dict:
+    """A Telegram ``callback_query`` for the ✅ button of one review message."""
+    return {
+        "id": callback_id,
+        "data": f"approve:{post_id}",
+        "from": {"id": int(user_id)},
+        "message": {"message_id": 1, "chat": {"id": int(REVIEW_CHANNEL)}},
+    }
+
+
+def _reject(post_id: int, *, user_id: str = ADMIN_ID, callback_id: str = "cb-reject") -> dict:
+    return {
+        "id": callback_id,
+        "data": f"reject:{post_id}",
+        "from": {"id": int(user_id)},
+        "message": {"message_id": 1, "chat": {"id": int(REVIEW_CHANNEL)}},
+    }
+
+
+# --- pure decision helpers ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -164,652 +162,475 @@ def _single_post_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         ("low", "low", True),
         ("medium", "low", True),
-        ("high", "medium", True),
+        ("high", "low", True),
         ("low", "medium", False),
+        ("medium", "medium", True),
         ("low", "high", False),
         (None, "low", False),
-        ("nonsense", "low", False),
+        ("bogus", "low", False),
     ],
 )
 def test_meets_importance_threshold(importance: str | None, minimum: str, expected: bool) -> None:
     assert meets_importance_threshold(importance, minimum) is expected
 
 
-def test_determine_status_covers_every_outcome() -> None:
-    relevant = LlmAnalysis.model_validate(VALID_ANSWER)
-    irrelevant = LlmAnalysis.model_validate(
-        {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""}
-    )
-    low_importance = LlmAnalysis.model_validate({**VALID_ANSWER, "importance": "low"})
-
-    assert determine_status(relevant, duplicate_of_id=None, min_importance_to_send="low") == "to_send"
-    assert (
-        determine_status(relevant, duplicate_of_id=7, min_importance_to_send="low")
-        == "skipped_duplicate"
-    )
-    assert (
-        determine_status(irrelevant, duplicate_of_id=None, min_importance_to_send="low")
-        == "skipped_irrelevant"
-    )
-    assert (
-        determine_status(low_importance, duplicate_of_id=None, min_importance_to_send="medium")
-        == "skipped_low_importance"
-    )
-
-
-def test_resolve_duplicate_id_maps_only_local_candidate_indexes() -> None:
-    """Invariant 4 — the index is 1-based and only the ids of that call are reachable."""
-    not_duplicate = LlmAnalysis.model_validate(VALID_ANSWER)
-    duplicate = LlmAnalysis.model_validate({**VALID_ANSWER, "duplicate_of_candidate_index": 1})
-
-    assert resolve_duplicate_id(not_duplicate, [_candidate(77, "t3_prev")]) is None
-    assert resolve_duplicate_id(duplicate, [_candidate(77, "t3_prev")]) == 77
-
-
-def test_resolve_duplicate_id_fails_loudly_for_an_out_of_range_index() -> None:
-    """The analyzer rejects that answer already, so reaching here is a bug, not bad input."""
-    analysis = LlmAnalysis.model_validate({**VALID_ANSWER, "duplicate_of_candidate_index": 9})
-
-    with pytest.raises(AssertionError, match="outside"):
-        resolve_duplicate_id(analysis, [])
-
-
-def test_build_post_record_for_the_failed_path_keeps_raw_post_fields() -> None:
-    record = build_post_record(_post(), status="failed", raw_response={"is_relevant": True})
-
-    assert record.id is None
-    assert record.status == "failed"
-    assert record.is_relevant is None
-    assert record.key_points == []
-    assert record.llm_raw_response == {"is_relevant": True}
-    assert record.title == "A new open model was released"
-
-
-# --- run_once --------------------------------------------------------------------
-
-
-def test_run_once_sends_a_new_relevant_post_exactly_once(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
+@pytest.mark.parametrize(
+    ("relevant", "duplicate_of_id", "importance", "expected"),
+    [
+        (False, None, "high", "skipped_irrelevant"),
+        (True, 42, "high", "skipped_duplicate"),
+        (True, None, "low", "skipped_low_importance"),
+        (True, None, "high", "to_send"),
+    ],
+)
+def test_determine_status(
+    relevant: bool, duplicate_of_id: int | None, importance: str, expected: str
 ) -> None:
-    repository, sender, _ = _harness(
-        monkeypatch, settings=settings, topics_config=topics_config
+    analysis = LlmAnalysis(**{**VALID_ANSWER, "is_relevant": relevant, "importance": importance})
+
+    status = determine_status(
+        analysis, duplicate_of_id=duplicate_of_id, min_importance_to_send="medium"
     )
 
-    pipeline.run_once()
-
-    assert repository.saved[0].status == "to_send"
-    # FR-9/NFR-3: the validated analysis JSON is kept for audit.
-    assert repository.saved[0].llm_raw_response == LlmAnalysis.model_validate(
-        VALID_ANSWER
-    ).model_dump(mode="json")
-    assert repository.sent_ids == [repository.last_id]
-    assert len(sender.messages) == 1
-    assert "خلاصه فارسی پست." in sender.messages[0]
-    assert "• نکته اول" in sender.messages[0]
-    # Invariant 2(d): the row is stored before the send is attempted.
-    assert repository.calls.index("save") < repository.calls.index("update_status")
-    assert repository.calls.count("update_status") == 1
+    assert status == expected
 
 
-def test_run_once_does_not_re_analyse_a_post_that_is_already_stored(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """Invariant 1: the second run sees the same `reddit_id` and never re-calls the LLM."""
-    repository, sender, llm = _harness(
-        monkeypatch, settings=settings, topics_config=topics_config
-    )
-
-    pipeline.run_once()
-    pipeline.run_once()
-
-    assert len(llm.calls) == 1  # type: ignore[attr-defined]
-    assert len(repository.saved) == 1
-    assert len(sender.messages) == 1
-
-
-def test_run_once_skips_a_post_that_is_already_stored(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        repository=FakeRepository(existing=("t3_1abcde",)),
-    )
-
-    pipeline.run_once()
-
-    assert repository.saved == []
-    assert repository.calls == ["fetch_pending_to_send", "exists"]
-    assert sender.messages == []
-
-
-def test_run_once_stores_irrelevant_posts_without_sending(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        answer=json.dumps(
-            {**VALID_ANSWER, "is_relevant": False, "summary_fa": ""}, ensure_ascii=False
-        ),
-    )
-
-    pipeline.run_once()
-
-    assert [record.status for record in repository.saved] == ["skipped_irrelevant"]
-    assert sender.messages == []
-    assert repository.updates == []
-
-
-def test_run_once_maps_a_duplicate_candidate_index_to_the_real_database_id(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """Invariant 4 — the LLM names candidate 2, and the id stored is that candidate's id."""
-    newer = _candidate(77, "t3_newer")
-    older = _candidate(41, "t3_older")
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        repository=FakeRepository(candidates=(newer, older)),
-        answer=json.dumps({**VALID_ANSWER, "duplicate_of_candidate_index": 2}, ensure_ascii=False),
-    )
-
-    pipeline.run_once()
-
-    stored = repository.saved[0]
-    assert stored.status == "skipped_duplicate"
-    assert stored.duplicate_of_id == 41  # not 2, and not the newest candidate either
-    assert sender.messages == []
-
-
-def test_run_once_skips_a_relevant_post_below_the_importance_threshold(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings.model_copy(update={"min_importance_to_send": "medium"}),
-        topics_config=topics_config,
-        answer=json.dumps({**VALID_ANSWER, "importance": "low"}, ensure_ascii=False),
-    )
-
-    pipeline.run_once()
-
-    assert [record.status for record in repository.saved] == ["skipped_low_importance"]
-    assert sender.messages == []
-
-
-def test_run_once_passes_the_configured_lookback_limits(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, _, _ = _harness(monkeypatch, settings=settings, topics_config=topics_config)
-
-    pipeline.run_once()
-
-    assert "fetch_recent_candidates(limit=50,hours=72)" in repository.calls
-
-
-def test_run_once_records_failed_output_and_still_processes_the_rest(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """Invariant 3 + Invariant 8: one invalid answer never stops the other posts."""
-    monkeypatch.setattr(
-        "app.pipeline.fetch_all",
-        lambda topics_config: [
-            _post("t3_1abcde", title="Broken post"),
-            _post("t3_2fghij", title="Good post"),
-        ],
-    )
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        llm=_answering_by_title(
-            {"Broken post": "sorry, no json", "Good post": VALID_JSON}
-        ),
-    )
-
-    pipeline.run_once()
-
-    assert [(record.title, record.status) for record in repository.saved] == [
-        ("Broken post", "failed"),
-        ("Good post", "to_send"),
+def test_resolve_duplicate_id_maps_the_position_to_the_real_row_id() -> None:
+    """Invariant 4: index 2 means the *second* candidate, i.e. its database id."""
+    analysis = LlmAnalysis(**{**VALID_ANSWER, "duplicate_of_candidate_index": 2})
+    candidates = [
+        PostRecord(id=101, reddit_id="t3_a", subreddit="mlops", source_topic_key=TOPIC_KEY, title="a", url="u"),
+        PostRecord(id=202, reddit_id="t3_b", subreddit="mlops", source_topic_key=TOPIC_KEY, title="b", url="u"),
     ]
-    assert repository.saved[0].llm_raw_response is None
-    assert len(sender.messages) == 1
-    assert "Good post" in sender.messages[0]
-    assert repository.sent_ids == [repository.last_id]
+
+    assert resolve_duplicate_id(analysis, candidates) == 202
 
 
-def test_run_once_writes_nothing_when_the_llm_transport_keeps_failing(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """A failed LLM call stores nothing, so the next run analyses the post again."""
-    repository, sender, _ = _harness(
-        monkeypatch, settings=settings, topics_config=topics_config, llm=_raise_runtime_error
+def test_resolve_duplicate_id_refuses_an_index_out_of_range() -> None:
+    """A defensive assert, not a guess: the analyzer already rejects such an answer."""
+    analysis = LlmAnalysis(**{**VALID_ANSWER, "duplicate_of_candidate_index": 3})
+    candidate = PostRecord(
+        id=101, reddit_id="t3_a", subreddit="mlops", source_topic_key=TOPIC_KEY, title="a", url="u"
     )
 
-    pipeline.run_once()  # must not raise
-
-    assert repository.saved == []
-    assert repository.updates == []
-    assert sender.messages == []
+    with pytest.raises(AssertionError):
+        resolve_duplicate_id(analysis, [candidate])
 
 
-def test_run_once_keeps_a_rejected_send_as_to_send(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, _, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        sender=FailingSender(),
-    )
+def test_a_fetched_post_becomes_a_pending_review_row() -> None:
+    record = build_post_record(_post())
 
-    pipeline.run_once()  # must not raise
-
-    assert repository.saved[0].status == "to_send"
-    assert repository.sent_ids == []
+    assert record.status == "new"
+    assert record.review_status == "pending_review"
+    assert record.summary_fa is None and record.is_relevant is None
 
 
-def test_run_once_wires_real_modules_end_to_end(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """Only the HTTP boundaries are faked: RSS parsing, analysis, formatting and the
-    store call all run for real (the storage itself is the in-memory fake).
-    """
-    from app.reddit_source import fetch_all as real_fetch_all
-    from tests.test_reddit_source import SAMPLE_FEED
-
-    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: SAMPLE_FEED.encode())
-    monkeypatch.setattr("app.pipeline.fetch_all", real_fetch_all)
-    repository, sender, _ = _harness(
-        monkeypatch, settings=settings, topics_config=topics_config
-    )
-
-    pipeline.run_once()
-
-    stored = repository.saved[0]
-    assert stored.reddit_id == "t3_1abcde"
-    assert stored.status == "to_send"
-    assert stored.source_topic_key == "ai"
-    assert stored.subreddit == "MachineLearning"
-    assert stored.importance == "high"
-    assert stored.key_points == ["نکته اول"]
-
-    message = sender.messages[0]
-    assert "📌 <b>A new open model was released</b>" in message
-    assert "r/MachineLearning • هوش مصنوعی • اهمیت: بالا" in message
-    assert "خلاصه فارسی پست." in message
-    assert "• نکته اول" in message
-    # The URL is the one the real parser read out of the feed entry.
-    assert message.endswith(
-        "🔗 https://www.reddit.com/r/MachineLearning/comments/1abcde/a_new_open_model/"
-    )
+# --- FR-12: the review gate -------------------------------------------------------
 
 
-def test_send_refuses_a_post_that_was_never_stored(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """Invariant 2 — sending before storing must be impossible."""
-    repository, sender, _ = _harness(
-        monkeypatch, settings=settings, topics_config=topics_config
-    )
-
-    with pytest.raises(ValueError, match="never stored"):
-        pipeline._send(_pending(5).model_copy(update={"id": None}), topic_names={})
-
-    assert sender.messages == []
-    assert repository.updates == []
-
-
-# --- retry_pending_sends (FR-11) --------------------------------------------------
-
-
-def test_retry_pending_sends_finishes_pending_rows_without_an_llm_call(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, sender, llm = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        repository=FakeRepository(pending=(_pending(5), _pending(6))),
-    )
-
-    pipeline.retry_pending_sends()
-
-    assert repository.sent_ids == [5, 6]
-    assert len(sender.messages) == 2
-    assert "خلاصه پست معلق." in sender.messages[0]
-    assert llm.calls == []  # type: ignore[attr-defined]
-
-
-def test_retry_pending_sends_continues_after_one_rejected_send(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    repository, sender, _ = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        repository=FakeRepository(pending=(_pending(5), _pending(6))),
-        sender=FakeSender(fail_first=True),
-    )
-
-    pipeline.retry_pending_sends()
-
-    assert repository.sent_ids == [6]
-    assert len(sender.messages) == 1
-    assert "Pending post 6" in sender.messages[0]
-
-
-def test_a_rejected_send_stays_to_send_and_is_retried_by_the_next_run(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, topics_config: TopicsConfig
-) -> None:
-    """The whole FR-11 loop with the in-memory store: reject -> keep -> retry -> sent."""
-    repository, sender, llm = _harness(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        sender=FakeSender(fail_first=True),
-    )
-
-    pipeline.run_once()
-
-    assert repository.saved[0].status == "to_send"
-    assert repository.sent_ids == []
-    assert sender.messages == []
-
-    # The next cycle fetches nothing new, so only the stored 'to_send' row is retried.
-    repository.pending = [
-        repository.saved[0].model_copy(update={"id": repository.last_id, "status": "to_send"})
-    ]
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [])
-
-    pipeline.run_once()
-
-    assert repository.sent_ids == [repository.last_id]
-    assert len(sender.messages) == 1
-    assert len(llm.calls) == 1  # type: ignore[attr-defined]  # never re-analysed
-
-
-# --- real storage boundary --------------------------------------------------------
-
-
-def test_a_rejected_send_is_recovered_from_the_database_on_the_next_run(
+def test_a_new_post_waits_for_the_admin_and_never_reaches_the_llm(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """Invariant 2 + FR-11 with real Postgres: store first, then send, and recover.
+    """The point of phase 5: RSS -> store -> private channel, and then nothing at all.
 
-    Only RSS/LLM/Telegram are faked here; the rows really go through ``db/schema.sql``.
+    No LLM call may happen before an admin presses ✅, and nothing may be published.
     """
-    from app.reddit_source import fetch_all as real_fetch_all
-    from tests.test_reddit_source import SAMPLE_FEED
-
-    reddit_id = f"{TEST_REDDIT_ID_PREFIX}e2e"
-    feed = SAMPLE_FEED.replace("t3_1abcde", reddit_id)
-    monkeypatch.setattr("app.reddit_source.fetch_feed", lambda feed_url: feed.encode("utf-8"))
-    # The sample feed has two entries; one post is enough to describe the FR-11 loop.
-    monkeypatch.setattr(
-        "app.pipeline.fetch_all", lambda topics_config: real_fetch_all(topics_config)[:1]
-    )
-    sender, llm = _patch_seams(
-        monkeypatch, settings=settings, topics_config=topics_config, sender=FailingSender()
-    )
-
-    def stored_rows() -> list[dict]:
-        with db_connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT reddit_id, status, sent_at, summary_fa FROM posts WHERE reddit_id LIKE %s",
-                (f"{TEST_REDDIT_ID_PREFIX}%",),
-            )
-            return cursor.fetchall()
-
-    # First run: Telegram is down, but the analysed post is already stored (Invariant 2).
-    pipeline.run_once()
-
-    assert [row["status"] for row in stored_rows()] == ["to_send"]
-    assert stored_rows()[0]["sent_at"] is None
-    assert len(llm.calls) == 1  # type: ignore[attr-defined]
-
-    # Second run: no new RSS item, so the stored 'to_send' row is retried (FR-11).
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: [])
-    working_sender = FakeSender()
-    monkeypatch.setattr("app.pipeline.send_message", working_sender)
+    llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
 
     pipeline.run_once()
 
-    assert [row["status"] for row in stored_rows()] == ["sent"]
-    assert stored_rows()[0]["sent_at"] is not None
-    assert len(llm.calls) == 1  # type: ignore[attr-defined]  # never re-analysed
-    assert len(working_sender.messages) == 1
-    assert "خلاصه فارسی پست." in working_sender.messages[0]
-    assert sender.messages == []
+    row = _row(taxonomy, _post().reddit_id)
+    assert row["status"] == "awaiting_review"
+    assert row["review_status"] == "pending_review"
+    assert row["reviewed_by"] is None and row["reviewed_at"] is None
+    assert row["summary_fa"] is None and row["is_relevant"] is None and row["ai_error"] is None
+    assert llm.calls == []  # no post may enter the LLM before approval
+    assert telegram.messages_to(PUBLIC_CHANNEL) == []
+
+    # Exactly one message, in the private channel, for this whole post.
+    assert len(telegram.messages_to(REVIEW_CHANNEL)) == 1
+    text = telegram.messages_to(REVIEW_CHANNEL)[0]
+    assert "یک پست تازه" in text and "mlops" in text and TOPIC_NAME in text
+
+    # ... and it carries the two buttons addressed to the stored row.
+    markup = telegram.buttons_to(REVIEW_CHANNEL)[0]
+    assert markup is not None
+    callbacks = [button["callback_data"] for button in markup["inline_keyboard"][0]]
+    assert callbacks == [f"approve:{row['id']}", f"reject:{row['id']}"]
+    assert row["private_message_id"] is not None
+    assert row["private_channel_id"] == REVIEW_CHANNEL
 
 
-def _patch_http_seams(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    settings: Settings,
-    topics_config: TopicsConfig,
-    posts: list[RawPost],
-    sender: FakeSender | None = None,
-    llm: Callable[[str, str], str] | None = None,
-) -> FakeSender:
-    """Patch only the HTTP boundaries; ``app.repository`` stays real (Postgres).
-
-    ``_patch_seams`` already injects the settings, the topics config and the notifier;
-    this adds the RSS items and deliberately leaves the repository untouched, so every
-    row really goes through ``db/schema.sql``.
-    """
-    monkeypatch.setattr("app.pipeline.fetch_all", lambda topics_config: list(posts))
-    sender, _ = _patch_seams(
-        monkeypatch, settings=settings, topics_config=topics_config, sender=sender, llm=llm
-    )
-    return sender  # type: ignore[return-value]
-
-
-def _row_for(connection: psycopg.Connection, reddit_id: str) -> dict:
-    """The stored row for one ``reddit_id`` (asserts that it exists)."""
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT reddit_id, status, sent_at, is_relevant, duplicate_of_id, importance "
-            "FROM posts WHERE reddit_id = %s",
-            (reddit_id,),
-        )
-        row = cursor.fetchone()
-    assert row is not None, f"no stored row for reddit_id={reddit_id}"
-    return row
-
-
-def _insert_candidate(
-    connection: psycopg.Connection, *, post_id: int, reddit_id: str, published_at: datetime
-) -> None:
-    """Seed one analysed row so the real ``fetch_recent_candidates`` can find it.
-
-    The id is set explicitly so a mapping test can prove the 1-based index really became
-    *that* row's id rather than the index value itself.
-    """
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO posts (
-                id, reddit_id, subreddit, source_topic_key, title, url, published_at,
-                is_relevant, topic, importance, summary_fa, key_points, status
-            ) VALUES (
-                %s, %s, 'MachineLearning', 'ai', %s, %s, %s,
-                TRUE, 'ai', 'medium', %s, '[]'::jsonb, 'sent'
-            )
-            """,
-            (
-                post_id,
-                reddit_id,
-                f"Candidate {reddit_id}",
-                f"https://example.com/{reddit_id}",
-                published_at,
-                f"خلاصه {reddit_id}",
-            ),
-        )
-
-
-def test_real_db_sends_a_new_relevant_post_exactly_once(
+def test_every_fetched_post_gets_its_own_review_message(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """FR-9 + FR-10 with real Postgres: store the row, then send exactly one message."""
-    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_new"
-    llm = FakeChatCompletion(VALID_JSON)
-    sender = _patch_http_seams(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        posts=[_post(reddit_id)],
-        llm=llm,
-    )
+    """FR-12: no digest — 3 fetched posts means 3 independent messages with 3 keyboards."""
+    posts = [_post(f"one"), _post("two"), _post("three")]
+    _, telegram = _harness(monkeypatch, settings=settings, posts=posts)
 
     pipeline.run_once()
 
-    row = _row_for(db_connection, reddit_id)
-    assert row["status"] == "sent"
-    assert row["sent_at"] is not None
-    assert row["is_relevant"] is True
-    assert row["duplicate_of_id"] is None
-    assert len(llm.calls) == 1
-    assert len(sender.messages) == 1
+    assert len(telegram.messages_to(REVIEW_CHANNEL)) == 3
+    callbacks = {
+        button["callback_data"]
+        for markup in telegram.buttons_to(REVIEW_CHANNEL)
+        for row in markup["inline_keyboard"]
+        for button in row
+    }
+    stored_ids = {
+        _row(taxonomy, post.reddit_id)["id"] for post in posts
+    }
+    assert callbacks == {f"approve:{i}" for i in stored_ids} | {f"reject:{i}" for i in stored_ids}
 
 
-def test_real_db_a_second_run_does_not_reanalyse_or_resend(
+def test_a_post_whose_review_message_fails_stays_new_and_is_retried(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """Invariant 1 with real Postgres: the stored ``reddit_id`` short-circuits the next run."""
-    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_stored"
-    llm = FakeChatCompletion(VALID_JSON)
-    sender = _patch_http_seams(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        posts=[_post(reddit_id)],
-        llm=llm,
-    )
+    """FR-12 crash recovery: nothing is lost when Telegram is down for one cycle."""
+    telegram = FakeTelegram()
+    telegram.fail_next_sends = 1
+    _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
 
     pipeline.run_once()
+
+    assert _row(taxonomy, _post().reddit_id)["status"] == "new"
+
+    pipeline.run_once()  # the post is still there, and Telegram works again
+
+    assert _row(taxonomy, _post().reddit_id)["status"] == "awaiting_review"
+    assert len(telegram.messages_to(REVIEW_CHANNEL)) == 1
+
+
+def test_a_known_post_is_not_stored_delivered_or_analysed_again(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """Invariant 1: the same ``reddit_id`` in a second cycle changes nothing."""
+    llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
+
+    pipeline.run_once()
+    first = _row(taxonomy, _post().reddit_id)
+
+    pipeline.run_once()
+
+    assert _row(taxonomy, _post().reddit_id) == first
+    assert len(telegram.messages_to(REVIEW_CHANNEL)) == 1
+    assert llm.calls == []
+
+
+def test_the_configured_fetch_limit_is_handed_to_the_collector(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """NFR-7: how many posts a cycle may take is configuration, not a constant."""
+    captured: list[tuple[Any, int]] = []
+
+    def _record(sources: Any, *, default_fetch_limit: int) -> list[RawPost]:
+        captured.append((sources, default_fetch_limit))
+        return []
+
+    llm, _ = _harness(monkeypatch, settings=settings)
+    monkeypatch.setattr("app.pipeline.fetch_all", _record)
+
+    pipeline.run_once()
+
+    assert captured, "the collector was not called"
+    sources, limit = captured[0]
+    assert limit == settings.rss_fetch_limit
+    assert [source.topic_key for source in sources], "no source was passed to the collector"
+    assert llm.calls == []
+
+
+def test_an_empty_fetch_produces_no_messages_and_no_llm_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    llm, telegram = _harness(monkeypatch, settings=settings, posts=[])
+
+    pipeline.run_once()
+
+    assert llm.calls == [] and telegram.sent == []
+    assert taxonomy.execute(
+        "SELECT count(*) AS n FROM posts WHERE reddit_id LIKE %s",
+        (f"{TEST_REDDIT_ID_PREFIX}%",),
+    ).fetchone()["n"] == 0
+
+
+# --- FR-13: approval, analysis, publication --------------------------------------
+
+
+def test_approving_a_post_analyses_and_publishes_it_once(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """The happy path end to end: ✅ -> one LLM call -> one public message."""
+    llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
+    pipeline.run_once()
+    post_id = _row(taxonomy, _post().reddit_id)["id"]
+
+    assert review.handle_callback(_approve(post_id)) is True
+
+    approved = _row(taxonomy, _post().reddit_id)
+    assert approved["status"] == "approved" and approved["review_status"] == "approved"
+    assert approved["reviewed_by"] == ADMIN_ID and approved["reviewed_at"] is not None
+    assert approved["approved_at"] is not None and approved["rejected_at"] is None
+    assert telegram.edits[-1][0] == review.PROCESSING_TEXT
+    assert llm.calls == []  # deciding a post is not analysing it
+
+    # What `main` does right after a decision: no RSS fetch, just the approved queue.
+    pipeline.process_approved_posts()
+
+    published = _row(taxonomy, _post().reddit_id)
+    assert published["status"] == "sent"
+    assert published["published_at"] is not None and published["ai_processed_at"] is not None
+    assert published["public_message_id"] is not None
+    assert published["public_channel_id"] == PUBLIC_CHANNEL
+    assert published["is_relevant"] is True and published["importance"] == "high"
+    assert published["summary_fa"] == VALID_ANSWER["summary_fa"]
+    assert published["llm_raw_response"] is not None
     assert len(llm.calls) == 1
 
-    pipeline.run_once()  # the feed still returns the same item
+    public = telegram.messages_to(PUBLIC_CHANNEL)
+    assert len(public) == 1
+    assert VALID_ANSWER["summary_fa"] in public[0] and "نکته اول" in public[0]
+    # The review message stays as the audit trail, its buttons replaced by the outcome.
+    assert telegram.edits[-1][0] == review.PUBLISHED_TEXT
 
-    assert len(llm.calls) == 1  # repository.exists() short-circuits before the LLM
-    assert len(sender.messages) == 1
-    assert repository.fetch_pending_to_send() == []
-    assert _row_for(db_connection, reddit_id)["status"] == "sent"
+    # Invariant 12: a second pass over the same post publishes nothing again.
+    pipeline.run_once()
+
+    assert len(telegram.messages_to(PUBLIC_CHANNEL)) == 1
+    assert len(llm.calls) == 1
+    assert repository.claim_for_publish(post_id) is False
 
 
-def test_real_db_maps_a_duplicate_index_to_the_real_candidate_id(
+def test_rejecting_a_post_stops_the_flow_before_the_llm(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """Invariant 4 with real Postgres: candidate #2 becomes that row's id, never the number 2."""
-    now = datetime.now(timezone.utc)
-    first_id, second_id = 771001, 771002
-    _insert_candidate(
-        db_connection,
-        post_id=first_id,
-        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_a",
-        published_at=now - timedelta(hours=1),
-    )
-    _insert_candidate(
-        db_connection,
-        post_id=second_id,
-        reddit_id=f"{TEST_REDDIT_ID_PREFIX}pipeline_cand_b",
-        published_at=now - timedelta(hours=2),
-    )
+    """FR-13: ❌ is terminal — no LLM, no translation, no summary, no publication."""
+    llm, telegram = _harness(monkeypatch, settings=settings, posts=[_post()])
+    pipeline.run_once()
+    post_id = _row(taxonomy, _post().reddit_id)["id"]
 
-    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_dup"
-    answer = json.dumps({**VALID_ANSWER, "duplicate_of_candidate_index": 2}, ensure_ascii=False)
-    sender = _patch_http_seams(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        posts=[_post(reddit_id)],
-        llm=FakeChatCompletion(answer),
-    )
+    assert review.handle_callback(_reject(post_id)) is True
+
+    rejected = _row(taxonomy, _post().reddit_id)
+    assert rejected["status"] == "rejected" and rejected["review_status"] == "rejected"
+    assert rejected["rejected_at"] is not None and rejected["reviewed_by"] == ADMIN_ID
+    assert rejected["summary_fa"] is None and rejected["ai_processed_at"] is None
+    assert telegram.edits[-1][0] == review.REJECTED_TEXT
 
     pipeline.run_once()
 
-    row = _row_for(db_connection, reddit_id)
+    assert llm.calls == []  # never analysed, not even in a later cycle
+    assert telegram.messages_to(PUBLIC_CHANNEL) == []
+    assert _row(taxonomy, _post().reddit_id)["status"] == "rejected"
+
+
+def test_the_first_of_two_simultaneous_decisions_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """Invariant 12: ``PENDING -> APPROVED`` succeeds exactly once."""
+    telegram = FakeTelegram()
+    _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
+    pipeline.run_once()
+    post_id = _row(taxonomy, _post().reddit_id)["id"]
+
+    assert review.handle_callback(_approve(post_id, callback_id="first")) is True
+    # The second admin presses the same, now stale, button.
+    assert review.handle_callback(_reject(post_id, user_id="888", callback_id="second")) is False
+
+    row = _row(taxonomy, _post().reddit_id)
+    assert row["review_status"] == "approved" and row["reviewed_by"] == ADMIN_ID
+    assert row["rejected_at"] is None
+    assert row["status"] == "approved"  # the losing click changed nothing
+    assert telegram.answers[-1] == ("second", review.ALREADY_REVIEWED_TEXT)
+    # The loser must not rewrite the message the winner already updated.
+    assert telegram.edits[-1][0] == review.PROCESSING_TEXT
+
+
+def test_only_listed_admins_may_decide(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """FR-12: the allow-list is the authorisation; nobody else can approve."""
+    telegram = FakeTelegram()
+    _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
+    pipeline.run_once()
+    post_id = _row(taxonomy, _post().reddit_id)["id"]
+
+    assert review.handle_callback(_approve(post_id, user_id="999")) is False
+
+    row = _row(taxonomy, _post().reddit_id)
+    assert row["status"] == "awaiting_review" and row["review_status"] == "pending_review"
+    assert row["reviewed_by"] is None
+    assert telegram.answers[-1] == ("cb-approve", review.NOT_ADMIN_TEXT)
+    assert telegram.edits == []
+
+
+def test_a_duplicate_is_recorded_against_the_real_id_of_the_second_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """Invariant 4 + FR-4: the model points at position 2, the database stores that row's id."""
+    older = _candidate(taxonomy, "candidate-one", summary="خلاصه اول", minutes_ago=120)
+    newer = _candidate(taxonomy, "candidate-two", summary="خلاصه دوم", minutes_ago=60)
+
+    llm, telegram = _harness(
+        monkeypatch,
+        settings=settings,
+        posts=[_post()],
+        llm=FakeChatCompletion(_answer(duplicate_of_candidate_index=2)),
+    )
+    pipeline.run_once()
+    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+
+    # What the LLM was shown: newest first, so position 2 is the older candidate.
+    listed = repository.fetch_recent_candidates(50, 72)
+    assert [candidate.id for candidate in listed] == [newer, older]
+
+    pipeline.process_approved_posts()
+
+    row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "skipped_duplicate"
-    assert row["duplicate_of_id"] == second_id
+    assert row["duplicate_of_id"] == listed[1].id  # a real row id, not the index 2
     assert row["duplicate_of_id"] != 2
-    assert sender.messages == []
+    assert telegram.messages_to(PUBLIC_CHANNEL) == []
+    assert telegram.edits[-1][0].startswith("✅ تأیید شد\n⛔️ منتشر نشد")
+    assert len(llm.calls) == 1
 
 
-def test_real_db_stores_a_low_importance_post_without_sending(
+def test_a_low_importance_post_is_not_published_even_after_approval(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """FR-10(c) with real Postgres: kept and labelled, never sent, never left pending."""
-    reddit_id = f"{TEST_REDDIT_ID_PREFIX}pipeline_low"
-    answer = json.dumps({**VALID_ANSWER, "importance": "low"}, ensure_ascii=False)
-    sender = _patch_http_seams(
+    """FR-10(c): the admin said yes, the importance threshold still says no."""
+    strict = settings.model_copy(update={"min_importance_to_send": "medium"})
+    llm, telegram = _harness(
         monkeypatch,
-        settings=settings.model_copy(update={"min_importance_to_send": "medium"}),
-        topics_config=topics_config,
-        posts=[_post(reddit_id)],
-        llm=FakeChatCompletion(answer),
+        settings=strict,
+        posts=[_post()],
+        llm=FakeChatCompletion(_answer(importance="low")),
     )
-
     pipeline.run_once()
+    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
 
-    row = _row_for(db_connection, reddit_id)
+    pipeline.process_approved_posts()
+
+    row = _row(taxonomy, _post().reddit_id)
     assert row["status"] == "skipped_low_importance"
-    assert row["is_relevant"] is True
-    assert row["importance"] == "low"
-    assert row["sent_at"] is None
-    assert sender.messages == []
-    assert repository.fetch_pending_to_send() == []  # nothing for FR-11 either
+    assert row["importance"] == "low" and row["published_at"] is None
+    assert telegram.messages_to(PUBLIC_CHANNEL) == []
+    assert len(llm.calls) == 1
 
 
-def test_real_db_records_failed_and_keeps_processing_the_next_post(
+def test_an_invalid_llm_answer_fails_only_that_post(
     monkeypatch: pytest.MonkeyPatch,
     settings: Settings,
-    topics_config: TopicsConfig,
-    db_connection: psycopg.Connection,
+    taxonomy: psycopg.Connection,
 ) -> None:
-    """Invariants 3 + 8 with real Postgres: a bad answer is stored as ``failed``, the run goes on."""
-    broken = f"{TEST_REDDIT_ID_PREFIX}pipeline_broken"
-    fine = f"{TEST_REDDIT_ID_PREFIX}pipeline_fine"
-    sender = _patch_http_seams(
-        monkeypatch,
-        settings=settings,
-        topics_config=topics_config,
-        posts=[_post(broken, title="Broken post"), _post(fine, title="Good post")],
-        llm=_answering_by_title(
-            {"Broken post": "sorry, no json", "Good post": VALID_JSON}
-        ),
+    """Invariant 3 and 8: unusable output is stored as failed, the queue carries on."""
+    bad = _post("bad", title="پست با پاسخ بد")
+    good = _post("good", title="پست سالم")
+
+    def _completion(system_prompt: str, user_prompt: str) -> str:
+        # The prompt carries the title (never the reddit_id — Invariant 4).
+        return "{not json at all" if bad.title in user_prompt else _answer()
+
+    llm = FakeChatCompletion(_answer())
+    telegram = patch_telegram(
+        monkeypatch, FakeTelegram(), default_chat_id=settings.telegram_chat_id
     )
+    monkeypatch.setattr("app.analyzer.chat_completion", _completion)
+    monkeypatch.setattr("app.pipeline.get_settings", lambda: settings)
+    monkeypatch.setattr("app.pipeline.fetch_all", lambda *a, **k: [bad, good])
+
+    # Both posts are fetched (the LLM is never called while storing) ...
+    pipeline.run_once()
+    assert llm.calls == []
+    for post in (bad, good):
+        assert review.handle_callback(_approve(_row(taxonomy, post.reddit_id)["id"])) is True
+
+    pipeline.process_approved_posts()
+
+    failed = _row(taxonomy, bad.reddit_id)
+    assert failed["status"] == "failed"
+    assert failed["ai_error"] and "JSON" in failed["ai_error"]
+    assert failed["is_relevant"] is None and failed["published_at"] is None
+    assert failed["ai_processed_at"] is not None
+
+    published = _row(taxonomy, good.reddit_id)
+    assert published["status"] == "sent"  # the failure did not stop the rest of the queue
+    assert len(telegram.messages_to(PUBLIC_CHANNEL)) == 1
+
+
+# --- FR-11: publication is retried, never repeated --------------------------------
+
+
+def test_a_rejected_publication_is_retried_without_re_analysing(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """FR-11: the row is durable, so a failed send is finished by the next run."""
+    telegram = FakeTelegram()
+    llm, _ = _harness(monkeypatch, settings=settings, telegram=telegram, posts=[_post()])
+    pipeline.run_once()
+    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+
+    telegram.fail_next_sends = 1  # the send to the public channel is refused
+    pipeline.process_approved_posts()
+
+    after_failure = _row(taxonomy, _post().reddit_id)
+    assert after_failure["status"] == "to_send"  # the claim was handed back
+    assert after_failure["published_at"] is None
+    assert after_failure["summary_fa"] is not None  # analysed once, and kept
+    assert len(llm.calls) == 1
+
+    pipeline.retry_pending_sends()  # what the next cycle starts with
+
+    recovered = _row(taxonomy, _post().reddit_id)
+    assert recovered["status"] == "sent"
+    assert recovered["published_at"] is not None and recovered["public_message_id"] is not None
+    assert len(llm.calls) == 1  # never re-analysed
+    assert len(telegram.messages_to(PUBLIC_CHANNEL)) == 1
+
+
+def test_the_lookback_limit_is_the_one_handed_to_the_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    taxonomy: psycopg.Connection,
+) -> None:
+    """Invariant 10: the candidate window is configuration-driven and never open-ended."""
+    seen: list[tuple[int, int]] = []
+
+    def _record(limit: int, hours: int) -> list[PostRecord]:
+        seen.append((limit, hours))
+        return []
+
+    bounded = settings.model_copy(update={"similarity_lookback_limit": 7})
+    _harness(monkeypatch, settings=bounded, posts=[_post()])
+    monkeypatch.setattr("app.pipeline.repository.fetch_recent_candidates", _record)
 
     pipeline.run_once()
+    review.handle_callback(_approve(_row(taxonomy, _post().reddit_id)["id"]))
+    pipeline.process_approved_posts()
 
-    broken_row = _row_for(db_connection, broken)
-    assert broken_row["status"] == "failed"
-    assert broken_row["is_relevant"] is None
-    assert broken_row["sent_at"] is None
-
-    fine_row = _row_for(db_connection, fine)
-    assert fine_row["status"] == "sent"
-    assert fine_row["sent_at"] is not None
-
-    assert len(sender.messages) == 1
-    assert "Good post" in sender.messages[0]
+    assert seen == [(7, bounded.similarity_lookback_hours)]

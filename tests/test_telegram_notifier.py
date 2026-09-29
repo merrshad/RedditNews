@@ -1,9 +1,11 @@
-"""Telegram notifier tests — ``httpx`` is faked, so nothing here touches the network (NFR-8).
+"""Telegram client tests — ``httpx`` is faked, so nothing here touches the network (NFR-8).
 
-The contract under test (FR-10/FR-11): ``send_message`` answers ``True`` only when
-Telegram accepted the message, reports an ordinary failure as ``False`` after the
-``HTTP_MAX_RETRIES`` budget is spent, and never lets the bot token reach a log line
-(Invariant 6).
+The contract under test: every function answers with a value instead of raising, and the
+bot token never reaches a log line (Invariant 6). ``send_message`` (FR-10) returns
+Telegram's ``message_id`` or ``None``; ``edit_message_text``/``answer_callback_query``
+(FR-12) return a boolean; ``get_updates`` returns a list (empty on failure, so the worker
+loop keeps running). An ordinary failure spends the ``HTTP_MAX_RETRIES`` budget; a
+rejected request (4xx) does not.
 """
 
 from __future__ import annotations
@@ -79,8 +81,8 @@ def http(monkeypatch: pytest.MonkeyPatch) -> FakeHttp:
 # --- success ----------------------------------------------------------------------
 
 
-def test_send_message_returns_true_and_posts_the_expected_payload(http: FakeHttp) -> None:
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is True
+def test_send_message_returns_the_message_id_and_posts_the_expected_payload(http: FakeHttp) -> None:
+    assert telegram_notifier.send_message(MESSAGE_TEXT) == 1
 
     assert http.attempts == 1
     call = http.calls[0]
@@ -106,7 +108,7 @@ def test_send_message_returns_false_after_retries_when_telegram_rejects(
     )
 
     # No exception may escape: the pipeline decides 'sent' vs keep for the next run.
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 3  # HTTP_MAX_RETRIES: throttling and 5xx may pass later
 
 
@@ -121,7 +123,7 @@ def test_a_rejected_request_is_not_retried(http: FakeHttp, status_code: int) -> 
         status_code=status_code, body={"ok": False, "description": "Bad Request: chat not found"}
     )
 
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 1
 
 
@@ -132,7 +134,7 @@ def test_a_rejected_request_is_logged_as_permanent(http: FakeHttp, caplog) -> No
     )
 
     with caplog.at_level(logging.ERROR):
-        assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+        assert telegram_notifier.send_message(MESSAGE_TEXT) is None
 
     assert "failed permanently" in caplog.text
 
@@ -140,14 +142,14 @@ def test_a_rejected_request_is_logged_as_permanent(http: FakeHttp, caplog) -> No
 def test_send_message_returns_false_when_the_body_reports_not_ok(http: FakeHttp) -> None:
     http.default = FakeResponse(status_code=200, body={"ok": False, "description": "chat not found"})
 
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 3
 
 
 def test_send_message_returns_false_for_a_non_json_response(http: FakeHttp) -> None:
     http.default = FakeResponse(status_code=502, valid_json=False)
 
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 3
 
 
@@ -156,7 +158,7 @@ def test_send_message_returns_false_when_the_transport_keeps_failing(http: FakeH
         f"Failed to connect to api.telegram.org/bot{TOKEN}/sendMessage"
     )
 
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 3
 
 
@@ -167,7 +169,7 @@ def test_the_attempt_budget_comes_from_settings(
     monkeypatch.setenv("HTTP_MAX_RETRIES", "1")
     http.default = FakeResponse(status_code=500)
 
-    assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
     assert http.attempts == 1
 
 
@@ -177,7 +179,7 @@ def test_a_failed_send_is_logged_so_the_post_can_be_retried(http: FakeHttp, capl
     )
 
     with caplog.at_level(logging.ERROR, logger="app.telegram_notifier"):
-        assert telegram_notifier.send_message(MESSAGE_TEXT) is False
+        assert telegram_notifier.send_message(MESSAGE_TEXT) is None
 
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert errors
@@ -215,13 +217,15 @@ def test_the_token_never_reaches_a_log_line(http: FakeHttp, caplog, outcome: obj
     assert TOKEN not in caplog.text
 
 
-def test_the_retry_log_names_the_target_chat(http: FakeHttp, caplog) -> None:
+def test_the_retry_log_names_the_method_but_never_the_token(http: FakeHttp, caplog) -> None:
+    """The retry label has to say which call failed without touching the credentials."""
     http.default = FakeResponse(status_code=500)
 
     with caplog.at_level(logging.DEBUG):
         telegram_notifier.send_message(MESSAGE_TEXT)
 
-    assert any(CHAT_ID in record.getMessage() for record in caplog.records)
+    assert any("sendMessage" in record.getMessage() for record in caplog.records)
+    assert TOKEN not in caplog.text
 
 
 # --- the 4096-character limit is formatting.py's problem, not this module's --------
@@ -233,7 +237,7 @@ def test_an_over_long_message_is_warned_about_but_sent_unchanged(
     over_long = "ا" * (telegram_notifier.TELEGRAM_MESSAGE_LIMIT + 1)
 
     with caplog.at_level(logging.WARNING, logger="app.telegram_notifier"):
-        assert telegram_notifier.send_message(over_long) is True
+        assert telegram_notifier.send_message(over_long) == 1
 
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
@@ -246,6 +250,107 @@ def test_a_message_at_the_limit_is_not_warned_about(http: FakeHttp, caplog) -> N
     at_limit = "x" * telegram_notifier.TELEGRAM_MESSAGE_LIMIT
 
     with caplog.at_level(logging.WARNING, logger="app.telegram_notifier"):
-        assert telegram_notifier.send_message(at_limit) is True
+        assert telegram_notifier.send_message(at_limit) == 1
 
     assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+
+
+# --- the review channel needs keyboards, edits and an answer for every press -------
+
+
+REVIEW_CHANNEL = "-100999"
+KEYBOARD = {"inline_keyboard": [[{"text": "✅ تأیید", "callback_data": "approve:7"}]]}
+
+
+def test_send_message_can_target_another_chat_with_an_inline_keyboard(http: FakeHttp) -> None:
+    """FR-12: the review message goes somewhere else and carries the ✅/❌ buttons."""
+    assert telegram_notifier.send_message(
+        MESSAGE_TEXT, chat_id=REVIEW_CHANNEL, reply_markup=KEYBOARD
+    ) == 1
+
+    payload = http.calls[0]["json"]
+    assert payload["chat_id"] == REVIEW_CHANNEL
+    assert payload["reply_markup"] == KEYBOARD
+
+
+def test_send_message_reports_failure_when_telegram_answers_without_a_message_id(
+    http: FakeHttp,
+) -> None:
+    http.default = FakeResponse(status_code=200, body={"ok": True, "result": True})
+
+    assert telegram_notifier.send_message(MESSAGE_TEXT) is None
+
+
+def test_edit_message_text_removes_the_buttons_by_default(http: FakeHttp) -> None:
+    """FR-12: a decided post keeps its message but loses the buttons."""
+    assert telegram_notifier.edit_message_text(
+        "✅ تأیید شد", chat_id=REVIEW_CHANNEL, message_id=42
+    ) is True
+
+    call = http.calls[0]
+    assert call["url"].endswith("/editMessageText")
+    assert call["json"]["message_id"] == 42
+    assert call["json"]["reply_markup"] == telegram_notifier.REMOVE_KEYBOARD
+
+
+def test_edit_message_text_reports_a_rejected_edit(http: FakeHttp) -> None:
+    http.default = FakeResponse(
+        status_code=400, body={"ok": False, "description": "message to edit not found"}
+    )
+
+    assert telegram_notifier.edit_message_text(
+        "متن", chat_id=REVIEW_CHANNEL, message_id=42
+    ) is False
+    assert http.attempts == 1  # a rejected edit is permanent, like a rejected send
+
+
+def test_answer_callback_query_stops_the_spinner(http: FakeHttp) -> None:
+    http.default = FakeResponse(status_code=200, body={"ok": True, "result": True})
+
+    assert telegram_notifier.answer_callback_query("cb-1", text="تأیید شد") is True
+
+    call = http.calls[0]
+    assert call["url"].endswith("/answerCallbackQuery")
+    assert call["json"] == {"callback_query_id": "cb-1", "text": "تأیید شد", "show_alert": False}
+
+
+def test_answer_callback_query_never_raises_on_failure(http: FakeHttp) -> None:
+    """The decision itself must stand even if the client cannot be told."""
+    http.default = httpx.ConnectError("boom")
+
+    assert telegram_notifier.answer_callback_query("cb-1") is False
+
+
+def test_get_updates_returns_the_updates_telegram_holds(http: FakeHttp) -> None:
+    updates = [{"update_id": 11, "callback_query": {"id": "cb-1", "data": "approve:1"}}]
+    http.default = FakeResponse(status_code=200, body={"ok": True, "result": updates})
+
+    assert telegram_notifier.get_updates(offset=5) == updates
+
+    call = http.calls[0]
+    assert call["url"].endswith("/getUpdates")
+    assert call["json"]["offset"] == 5
+    assert call["json"]["timeout"] == telegram_notifier.LONG_POLL_SECONDS
+    # The client timeout must outlast the server-side long poll, or httpx gives up first.
+    assert call["timeout"] > telegram_notifier.LONG_POLL_SECONDS
+
+
+def test_a_short_poll_is_used_when_a_cycle_is_due(http: FakeHttp) -> None:
+    http.default = FakeResponse(status_code=200, body={"ok": True, "result": []})
+
+    assert telegram_notifier.get_updates(long_poll_seconds=0) == []
+    assert http.calls[0]["json"]["timeout"] == 0
+    assert "offset" not in http.calls[0]["json"]  # no cursor yet: take what is pending
+
+
+def test_get_updates_returns_an_empty_list_instead_of_raising(http: FakeHttp) -> None:
+    """NFR-2: a Telegram outage must not end the worker loop."""
+    http.default = httpx.ConnectError("api.telegram.org unreachable")
+
+    assert telegram_notifier.get_updates() == []
+
+
+def test_get_updates_ignores_a_non_list_result(http: FakeHttp) -> None:
+    http.default = FakeResponse(status_code=200, body={"ok": True, "result": {"nope": 1}})
+
+    assert telegram_notifier.get_updates() == []

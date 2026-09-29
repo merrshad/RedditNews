@@ -6,8 +6,9 @@
 
 ## TL;DR برای Agentها
 - این یک پروژه **MVP** است. اصول **KISS / DRY / YAGNI** و **جداسازی مسئولیت‌ها (Separation of Concerns)** بر هر تصمیم دیگری اولویت دارند. اگر بین «ساده و کافی» و «کامل و پیچیده» شک داشتی، ساده را انتخاب کن.
-- پایپ‌لاین یک جهته است: **RSS → بررسی تکراری دقیق (DB) → یک تماس LLM (فیلتر ربط + تشخیص شباهت + دسته‌بندی + اهمیت + خلاصه فارسی + نکات کلیدی) → ذخیره در Postgres → ارسال به یک کانال/چت ثابت تلگرام**.
-- چیزهایی که **عمداً** در MVP نیستند (بخش ۲ را ببین): Reddit API رسمی/OAuth، تحلیل کامنت‌ها، چند کاربره بودن تلگرام، embedding/pgvector، صف پیام (Celery/RabbitMQ)، پنل وب، CI.
+- پایپ‌لاین یک گیت انسانی دارد (فاز ۵): **RSS (سقف قابل‌تنظیم به‌ازای هر منبع) → بررسی تکراری دقیق (DB) → ذخیره + ارسال هر پست جداگانه به کانال خصوصی بررسی با دکمه‌های ✅/❌ → تأیید ادمین (اتمیک) → یک تماس LLM (فیلتر ربط + تشخیص شباهت + دسته‌بندی + اهمیت + خلاصه فارسی + نکات کلیدی) → ارسال به کانال عمومی**. هیچ پستی قبل از تأیید ادمین به LLM نمی‌رود.
+- موضوعات و فیدها **داده** هستند، نه کد: در جدول‌های `topics`/`sources` نگه داشته می‌شوند و ادمین با دستورهای تلگرام‌محور آن‌ها را مدیریت می‌کند (بخش ۵، FR-14).
+- چیزهایی که **عمداً** در MVP نیستند (بخش ۲ را ببین): Reddit API رسمی/OAuth، تحلیل کامنت‌ها، embedding/pgvector، صف پیام (Celery/RabbitMQ)، پنل وب، CI.
 - قبل از هر PR: اگر چیزی در معماری، schema، pipeline، env varها یا Invariantها تغییر کرد، بخش مربوطه همین فایل را اصلاح کن.
 
 ---
@@ -19,14 +20,14 @@
 
 ### ۱.۲ راه‌حل
 یک سرویس پایتونی بدون وابستگی به زیرساخت سنگین که:
-1. به‌صورت دوره‌ای از فیدهای RSS ساب‌ردیت‌ها/جست‌وجوهای از پیش تعریف‌شده پست جدید می‌گیرد.
-2. با یک مدل زبانی (LLM) هم‌زمان ربط، شباهت با پست‌های اخیر، موضوع، اهمیت، خلاصه فارسی و نکات کلیدی را استخراج می‌کند.
-3. نتیجه را در Postgres ذخیره می‌کند (idempotent، قابل audit).
-4. پست‌های «مناسب» (مرتبط + غیرتکراری + بالای آستانه اهمیت) را با فرمت خوانا به یک کانال/چت ثابت تلگرام ارسال می‌کند.
+1. به‌صورت دوره‌ای از فیدهای RSS پیکربندی‌شده (سقف پذیرش هر فید قابل تنظیم) پست جدید می‌گیرد.
+2. هر پست تازه را در Postgres ذخیره و **بی‌درنگ و بدون هیچ پردازش AI** به یک کانال خصوصی تلگرام می‌فرستد تا یک ادمین آن را تأیید یا رد کند.
+3. پس از تأیید ادمین، با یک مدل زبانی (LLM) هم‌زمان ربط، شباهت با پست‌های اخیر، موضوع، اهمیت، خلاصه فارسی و نکات کلیدی را استخراج می‌کند.
+4. اگر نتیجه از دروازه‌های کیفیت رد شد، منتشر نمی‌کند؛ وگرنه با فرمت خوانا به کانال عمومی تلگرام می‌فرستد. پیام ریویو در کانال خصوصی می‌ماند (سابقه/audit).
 
 ### ۱.۳ معیار موفقیت MVP
-- سرویس بدون دخالت انسان و به‌صورت زمان‌بندی‌شده اجرا می‌شود.
-- پست تکراری دو بار در دیتابیس ذخیره یا دو بار به تلگرام ارسال **نمی‌شود**.
+- سرویس به‌صورت زمان‌بندی‌شده و خودکار اجرا می‌شود؛ تنها نقطه‌ای که انسان دخالت می‌کند تأیید/رد هر پست در کانال خصوصی است.
+- پست تکراری دو بار در دیتابیس ذخیره یا دو بار به تلگرام ارسال **نمی‌شود**، و هیچ پستی بدون تأیید ادمین به LLM نمی‌رود یا در کانال عمومی منتشر نمی‌شود.
 - خروجی تلگرام همیشه فارسی، خوانا و شامل خلاصه + نکات کلیدی + لینک اصلی پست است.
 - کرش یا خطای موقت (شبکه، LLM، تلگرام) باعث از دست رفتن پست یا ارسال تکراری نمی‌شود.
 
@@ -35,22 +36,25 @@
 ## ۲. دامنه MVP
 
 ### در دامنه (In Scope)
-- واکشی RSS از فهرست فیدهای پیکربندی‌شده.
+- واکشی RSS از منابع پیکربندی‌شده، با سقف قابل‌تنظیم برای هر منبع (`RSS_FETCH_LIMIT` پیش‌فرض + بازنویسی به‌ازای هر منبع).
 - تشخیص «قبلاً دیده شده» بر اساس شناسه پست (دقیق).
-- یک تماس LLM برای: فیلتر ربط، تشخیص شباهت با پست‌های اخیر، دسته‌بندی موضوع، تعیین اهمیت، خلاصه فارسی، نکات کلیدی.
-- ذخیره در Postgres (یک جدول اصلی).
-- ارسال broadcast به یک چت/کانال تلگرام ثابت.
+- **گیت انسانی (فاز ۵)**: ارسال هر پست تازه به یک کانال خصوصی بررسی، یک پیام مستقل برای هر پست، با دکمه‌های ✅/❌ و ثبت کامل تصمیم در دیتابیس.
+- مدیریت موضوعات و منابع (افزودن/ویرایش/حذف/فعال‌غیرفعال، تعیین موضوع، آدرس فید و سقف واکشی) با دستورهای ادمین در تلگرام.
+- یک تماس LLM برای: فیلتر ربط، تشخیص شباهت با پست‌های اخیر، دسته‌بندی موضوع، تعیین اهمیت، خلاصه فارسی، نکات کلیدی — **فقط پس از تأیید ادمین**.
+- ذخیره در Postgres (سه جدول: `topics`، `sources`، `posts`).
+- ارسال به دو مقصد: کانال خصوصی بررسی و کانال عمومی انتشار.
 - اجرای همه چیز در Docker (Postgres + سرویس اپ) با docker-compose.
 
 ### خارج از دامنه (Out of Scope — عمداً ساده نگه‌داشته شده، YAGNI)
 - Reddit API رسمی / OAuth / PRAW (فاز بعدی، اگر RSS کافی نبود).
 - تحلیل کامنت‌های پست (فقط عنوان + متن/خلاصه خود پست).
-- مدیریت چند مشترک تلگرام، دستورات ربات، پنل مدیریت.
+- اشتراک چندکاربره (هر مصرف‌کننده یک کانال خودش): تنها یک کانال عمومی است و دستورهای ربات فقط برای ادمین‌های فهرست‌شده.
 - Embedding/Vector DB برای تشخیص شباهت (این کار به LLM سپرده شده — بخش ۴.۲).
 - صف پیام توزیع‌شده (Celery/RabbitMQ/Kafka) — یک پردازش تک‌رشته‌ای کافی است.
-- رابط وب/داشبورد، احراز هویت، چند کاربره بودن سیستم.
+- رابط وب/داشبورد و احراز هویت جداگانه: «پنل ادمین» همان دستورهای ربات تلگرام است و احراز هویت از هویت تلگرام (`TELEGRAM_ADMIN_IDS`) می‌آید.
 - تست خودکار CI/CD (پیشنهاد می‌شود بعداً اضافه شود، اما برای MVP الزامی نیست).
 - بازگردانی تاریخی (backfill) پست‌های قدیمی‌تر از اولین اجرا.
+- ویرایش یا حذف پیام‌های گذشته در کانال‌ها، و انتشار خودکار بدون تأیید ادمین.
 
 اگر در آینده نیاز به هرکدام از موارد بالا شد، باید ابتدا این فایل به‌روزرسانی شود (چرا لازم شد + چه چیزی تغییر می‌کند) و بعد کد نوشته شود.
 
@@ -64,14 +68,18 @@
 |---|---|---|
 | ارائه‌دهنده LLM | یک سرویس **OpenAI-compatible** (رایگان)، آدرس/مدل از طریق env قابل تغییر | کاربر خواسته از APIهای رایگان سازگار با OpenAI استفاده شود؛ برای عدم قفل‌شدن روی یک provider خاص، `OPENAI_BASE_URL` و `OPENAI_MODEL` پیکربندی‌پذیرند. |
 | تشخیص شباهت/تکرار محتوایی | به همان LLM که خلاصه‌سازی می‌کند سپرده شده (نه embedding/pgvector) | ساده‌ترین راه برای MVP؛ یک تماس LLM هم فیلتر ربط، هم شباهت، هم دسته‌بندی، هم اهمیت، هم خلاصه و هم نکات کلیدی را انجام می‌دهد. نیازی به زیرساخت vector نیست. |
-| کانال ارسال تلگرام | یک چت/کانال ثابت (`TELEGRAM_CHAT_ID`)، فقط broadcast، بدون `/start` یا مدیریت مشترک | ساده‌ترین حالت ممکن برای MVP؛ نیازی به polling برای update های ورودی تلگرام نیست، فقط `sendMessage` کافی است. |
+| کانال‌های تلگرام | دو مقصد ثابت: کانال خصوصی بررسی (`TELEGRAM_REVIEW_CHANNEL_ID`) و کانال عمومی (`TELEGRAM_CHAT_ID`) | یک گیت انسانی خواستهٔ صریح کاربر است؛ کانال خصوصی جای تصمیم و کانال عمومی جای انتشار است. |
+| دریافت تصمیم‌های ادمین | `getUpdates` (long-polling) روی همان Bot API با `httpx`، بدون فریم‌ورک ربات | دکمه‌های inline بدون دریافت update کار نمی‌کنند؛ long-polling کمترین زیرساخت است (بدون URL عمومی/HTTPS و بدون سرویس اضافه) و باعث می‌شود پاسخ به یک کلیک چند ثانیه باشد نه یک دور polling. |
+| مدیریت موضوعات/منابع | در جدول‌های `topics`/`sources`، مدیریت با دستورهای تلگرامی ادمین | «نباید hard-code باشند» یعنی داده؛ DB تنها منبع حقیقت می‌شود و نیازی به پنل وب/احراز هویت جدا نیست. |
 
 ### مفروضات/تصمیمات تکمیلی که Agent (نه کاربر) گرفته و باید در صورت نیاز با کاربر بازبینی شود
 اینها جزو چیزهایی هستند که کاربر گفت «اگر جایی تصمیمی لازم بود که مشخص نشده، خودت تصمیم بگیر» — پس به‌عنوان **فرض مستند‌شده** ثبت شده‌اند، نه سوال باز:
 
 - **آستانه ارسال (`MIN_IMPORTANCE_TO_SEND`)**: پیش‌فرض `low`، یعنی هر پست مرتبط و غیرتکراری ارسال می‌شود؛ اما این مقدار config‌پذیر است تا اگر نویز زیاد بود، بدون تغییر کد بشود سخت‌گیرتر شد.
 - **کاندیدهای تشخیص شباهت**: به‌جای مقایسه با کل جدول، فقط با N پست اخیر (`SIMILARITY_LOOKBACK_LIMIT`، پیش‌فرض ۵۰) در بازه M ساعت اخیر (`SIMILARITY_LOOKBACK_HOURS`، پیش‌فرض ۷۲) مقایسه می‌شود — برای محدود نگه‌داشتن اندازه prompt و هزینه.
-- **فهرست موضوعات مجاز**: از `config/topics.yaml` خوانده می‌شود و همان‌ها به‌عنوان گزینه‌های مجاز `topic` به LLM داده می‌شوند (نه دسته‌بندی آزاد). فهرست واقعی ساب‌ردیت‌ها/موضوعات هنوز باید توسط کاربر پر شود (بخش ۱۵).
+- **فهرست موضوعات مجاز**: از جدول `topics` (فقط ردیف‌های `is_active`) خوانده می‌شود و همان‌ها به‌عنوان گزینه‌های مجاز `topic` به LLM داده می‌شوند (نه دسته‌بندی آزاد). فهرست اولیه در `db/schema.sql` seed می‌شود و از آن به بعد ادمین آن را مدیریت می‌کند.
+- **سقف واکشی**: `RSS_FETCH_LIMIT` (پیش‌فرض ۲۵) سقف پیش‌فرض هر منبع در هر اجراست و هر منبع می‌تواند `fetch_limit` خودش را داشته باشد؛ مقدار واقعی همیشه `min(سقف, تعداد آیتم‌های موجود)` است.
+- **ادمین‌ها**: `TELEGRAM_ADMIN_IDS` فهرست idهای مجاز است؛ خالی بودن آن یعنی «هیچ‌کس» (امنترین پیش‌فرض) و نه «همه».
 - **زبان عنوان پست**: عنوان اصلی پست (معمولاً انگلیسی) دست‌نخورده نگه داشته می‌شود؛ فقط خلاصه و نکات کلیدی طبق خواسته صریح کاربر فارسی تولید می‌شوند.
 - **زمان‌بندی اجرا**: به‌جای Celery/APScheduler، یک حلقه ساده‌ی `while True: run(); sleep(POLL_INTERVAL_SECONDS)` داخل همان پردازش — کمترین وابستگی ممکن.
 
@@ -82,41 +90,59 @@
 ### ۴.۱ جریان کلی
 
 ```
-                ┌───────────────────────┐
-                │ config/topics.yaml    │  فهرست فیدهای RSS + موضوعات مجاز
-                └───────────┬───────────┘
-                            │
-                            ▼
- ۱) reddit_source.py   ── واکشی و parse فیدهای RSS
-                            │  (هر آیتم: reddit_id, subreddit, title, url, author,
-                            │   published_at, raw_content)
-                            ▼
- ۲) repository.py      ── آیا reddit_id از قبل در DB هست؟
-                            │
-                     بله ──┤── نادیده گرفته می‌شود (بدون تماس LLM)
-                            │
-                          خیر
-                            ▼
- ۳) repository.py      ── واکشی حداکثر N پست اخیر به‌عنوان «کاندیدهای شباهت»
-                            ▼
- ۴) analyzer.py +      ── یک تماس LLM با prompt واحد:
+                ┌───────────────────────────────┐
+                │ tables: topics / sources      │  موضوعات مجاز + فیدها + سقف هر فید
+                └──────────────┬────────────────┘
+                               │
+                               ▼
+ ۱) reddit_source.py  ── واکشی و parse هر منبع فعال، حداکثر
+                               │   min(fetch_limit منبع, تعداد آیتم‌های موجود)
+                               │   (هر آیتم: reddit_id, subreddit, title, url, author,
+                               │    posted_at, raw_content)
+                               ▼
+ ۲) repository.py     ── آیا reddit_id از قبل در DB هست؟
+                               │
+                        بله ──┤── نادیده گرفته می‌شود (بدون ذخیره و بدون LLM)
+                               │
+                             خیر
+                               ▼
+ ۳) repository.py     ── ذخیره رکورد ناقابل‌تحلیل با status='new' (FR-9)
+                               ▼
+ ۴) review.py         ── یک پیام مستقل در کانال خصوصی + دکمه‌های ✅/❌
+                               │   (status → 'awaiting_review' و ذخیره message_id)
+                               ▼
+ ۵) ادمین             ── کلیک ✅ یا ❌  (اتمیک: فقط یک کلیک موفق می‌شود)
+                               │
+              ❌ ─────────────┤── status='rejected' — پایان خط: نه LLM، نه ترجمه،
+                               │                     نه خلاصه، نه انتشار
+                               │
+                             ✅ (status='approved')
+                               ▼
+ ۶) repository.py     ── واکشی حداکثر N پست اخیر به‌عنوان «کاندیدهای شباهت»
+                               ▼
+ ۷) analyzer.py +     ── یک تماس LLM با prompt واحد:
     llm_client.py           ورودی: پست جدید + کاندیدها + فهرست موضوعات مجاز
                             خروجی (JSON اعتبارسنجی‌شده با Pydantic):
                               is_relevant, duplicate_of_candidate_index,
                               topic, importance, summary_fa, key_points
-                            ▼
- ۵) repository.py      ── ذخیره رکورد کامل در جدول posts (همیشه، حتی اگر
-                            نامرتبط/تکراری تشخیص داده شود) + تعیین status
-                            ▼
- ۶) telegram_notifier.py── اگر status == 'to_send': ارسال پیام فرمت‌شده
-                            و به‌روزرسانی status → 'sent'
+                               ▼
+ ۸) pipeline.py       ── تعیین status نهایی از روی نتیجه LLM:
+                            skipped_irrelevant / skipped_duplicate /
+                            skipped_low_importance / to_send
+                               ▼
+ ۹) telegram_notifier.py── فقط اگر status == 'to_send': claim اتمیک، ارسال به
+                            کانال عمومی، ثبت public_message_id و published_at
+                            (status → 'sent')، و ویرایش پیام ریویو به «منتشر شد»
 ```
 
-علاوه بر جریان بالا، **در ابتدای هر اجرا**، قبل از واکشی RSS جدید، سیستم پست‌های باقی‌مانده با `status = 'to_send'` از اجراهای قبلی (که تحلیل شده‌اند ولی ارسال‌شان به هر دلیلی کامل نشده) را دوباره تلاش می‌کند تا ارسال شوند (بازیابی پس از کرش — بخش ۷، Invariant شماره ۷).
+علاوه بر جریان بالا، **در ابتدای هر اجرا**، قبل از واکشی RSS جدید، سیستم سه صف باقی‌مانده از اجراهای قبلی را خالی می‌کند (بازیابی پس از کرش — بخش ۷، Invariant ۷ و ۱۲):
+- `status = 'new'` → پیام ریویو هنوز تحویل نشده است؛ دوباره فرستاده می‌شود.
+- `status = 'approved'` → ادمین تأیید کرده ولی LLM هنوز اجرا نشده است.
+- `status = 'to_send'` → تحلیل شده و منتظر انتشار است، یا ارسال قبلی ناموفق بوده.
 
-**مسیرهای خطا در مرحله ۴ (مهم برای Invariant ۳ و ۷):**
-- **خروجی LLM نامعتبر بود** (JSON ناقص، فیلد نامعتبر، `topic` خارج از فهرست مجاز، ایندکس کاندید خارج از محدوده): رکورد با `status='failed'` و در صورت وجود، `llm_raw_response` ذخیره می‌شود؛ هرگز به‌طور پیش‌فرض مرتبط/غیرتکراری فرض نمی‌شود (Invariant ۳).
-- **تماس LLM/شبکه شکست خورد** (بعد از اتمام `HTTP_MAX_RETRIES`): هیچ رکوردی نوشته نمی‌شود تا پست در دور بعدی دوباره واکشی و تحلیل شود؛ ثبت‌نکردن اینجا لازم است تا با `status='failed'` (که به معنی «خروجی نامعتبر» است) اشتباه نشود و پست از دست نرود (NFR-2، Invariant ۷).
+**مسیرهای خطا در مرحله ۷ (مهم برای Invariant ۳ و ۷):**
+- **خروجی LLM نامعتبر بود** (JSON ناقص، فیلد نامعتبر، `topic` خارج از فهرست مجاز، ایندکس کاندید خارج از محدوده): رکورد با `status='failed'`، `ai_error` و `ai_processed_at` و در صورت وجود `llm_raw_response` ذخیره می‌شود و پیام ریویو با هشدار ویرایش می‌شود؛ هرگز به‌طور پیش‌فرض مرتبط/غیرتکراری فرض نمی‌شود (Invariant ۳).
+- **تماس LLM/شبکه شکست خورد** (بعد از اتمام `HTTP_MAX_RETRIES`): هیچ رکورد تازه‌ای نوشته نمی‌شود و رکورد مورد نظر در وضعیت `approved` می‌ماند تا **دور بعد همان پست را دوباره تحلیل کند** (بدون واکشی دوباره از RSS و بدون پیام ریویو جدید)؛ فرقش با `failed` این است که `failed` یعنی «خروجی نامعتبر» و نیاز به بررسی دستی دارد، پس این دو هرگز قاطی نمی‌شوند (NFR-2، Invariant ۳ و ۷).
 
 ### ۴.۲ چرا مراحل ۳ تا ۸ کاربر در یک تماس LLM ادغام شده‌اند
 
@@ -140,17 +166,21 @@
 
 | # | عنوان | شرح |
 |---|---|---|
-| FR-1 | دریافت پست جدید | سرویس هر `POLL_INTERVAL_SECONDS` ثانیه تمام فیدهای RSS تعریف‌شده در `config/topics.yaml` را واکشی و parse می‌کند (`reddit_id`, `subreddit`, `title`, `url`, `author`, `published_at`, `raw_content`). |
-| FR-2 | بررسی تکراری بودن (دقیق) | پیش از هر پردازش دیگر، `reddit_id` در جدول `posts` چک می‌شود. اگر موجود بود، آیتم بدون تماس با LLM نادیده گرفته می‌شود. |
-| FR-3 | حذف محتوای نامرتبط | خروجی LLM شامل `is_relevant: bool` است؛ تصمیم بر اساس تطبیق با فهرست موضوعات مجاز `config/topics.yaml` و کیفیت/اسپم بودن محتوا گرفته می‌شود. |
+| FR-1 | دریافت پست جدید | سرویس هر `POLL_INTERVAL_SECONDS` تمام منابع فعال جدول `sources` را واکشی و parse می‌کند و از هر منبع حداکثر `min(fetch_limit منبع, تعداد آیتم‌های موجود)` پست برمی‌دارد (`reddit_id`, `subreddit`, `source_topic_key`, `title`, `url`, `author`, `posted_at`, `raw_content`). |
+| FR-2 | بررسی تکراری بودن (دقیق) | پیش از هر پردازش دیگر، `reddit_id` در جدول `posts` چک می‌شود. اگر موجود بود، آیتم نادیده گرفته می‌شود: نه ذخیره، نه LLM، نه پیام ریویو. |
+| FR-3 | حذف محتوای نامرتبط | خروجی LLM شامل `is_relevant: bool` است؛ تصمیم بر اساس تطبیق با فهرست موضوعات مجاز (جدول `topics`) و کیفیت/اسپم بودن محتوا گرفته می‌شود. |
 | FR-4 | تشخیص پست‌های مشابه/تکراری معنایی | همان تماس LLM با در اختیار داشتن حداکثر `SIMILARITY_LOOKBACK_LIMIT` پست اخیر (در `SIMILARITY_LOOKBACK_HOURS` ساعت گذشته)، `duplicate_of_candidate_index` را برمی‌گرداند (`null` اگر مشابهی نبود). |
-| FR-5 | تعیین موضوع | خروجی LLM شامل `topic` است که باید یکی از مقادیر تعریف‌شده در `config/topics.yaml` باشد. |
+| FR-5 | تعیین موضوع | خروجی LLM شامل `topic` است که باید یکی از کلیدهای فعال جدول `topics` باشد (موضوعی که ادمین تعریف کرده). |
 | FR-6 | تعیین اهمیت | خروجی LLM شامل `importance` با یکی از سه مقدار `low` / `medium` / `high` است. |
 | FR-7 | تولید خلاصه فارسی | خروجی LLM شامل `summary_fa` است: خلاصه‌ای فارسی، مستقل از زبان پست اصلی. |
 | FR-8 | استخراج نکات مهم | خروجی LLM شامل `key_points` است: آرایه‌ای از ۲ تا ۵ رشته‌ی فارسی کوتاه (نکته‌به‌نکته). این محدوده در `app/prompts/analysis_prompt.md` به مدل اعلام می‌شود؛ `LlmAnalysis` عمداً روی *تعداد* سخت‌گیر نیست (بخش ۱۲) تا یک نکتهٔ اضافه باعث `failed` شدن و از دست رفتن یک پست معتبر نشود. |
-| FR-9 | ذخیره در دیتابیس | نتیجه نهایی — چه پست مرتبط باشد چه نه — همیشه در جدول `posts` ذخیره می‌شود (برای جلوگیری از پردازش مجدد و برای audit). خروجی تحلیل (JSON اعتبارسنجی‌شده با Pydantic) هم در `llm_raw_response` نگه داشته می‌شود. |
-| FR-10 | ارسال تلگرام | فقط پست‌هایی که `is_relevant = true`، `duplicate_of_id = null` و `importance >= MIN_IMPORTANCE_TO_SEND` باشند، به `TELEGRAM_CHAT_ID` ارسال می‌شوند. پیام شامل عنوان، subreddit، موضوع، اهمیت (فارسی)، خلاصه فارسی، نکات کلیدی (bullet) و لینک پست است. پس از ارسال موفق، `status='sent'` و `sent_at` ثبت می‌شود. |
-| FR-11 | بازیابی پس از کرش | در ابتدای هر اجرا، پیش از واکشی RSS جدید، پست‌های با `status='to_send'` باقی‌مانده از اجرای قبلی دوباره برای ارسال تلاش می‌شوند (بدون تحلیل مجدد با LLM). |
+| FR-9 | ذخیره در دیتابیس | هر پست تازه **پیش از هر پردازش AI** در جدول `posts` ذخیره می‌شود (`status='new'`) تا نه گم شود و نه دوباره واکشی؛ نتیجه تحلیل هم بعداً روی همان ردیف نوشته می‌شود (خروجی اعتبارسنجی‌شده با Pydantic در `llm_raw_response`). |
+| FR-10 | ارسال تلگرام | شرط انتشار: `review_status = 'approved'` **و** `is_relevant = true` **و** `duplicate_of_id = null` **و** `importance >= MIN_IMPORTANCE_TO_SEND`. ارسال با claim اتمیک به کانال عمومی (`TELEGRAM_CHAT_ID`) انجام می‌شود و پس از موفقیت `public_message_id`, `published_at` و `status='sent'` ثبت می‌شود. پیام شامل عنوان، subreddit، موضوع، اهمیت (فارسی)، خلاصه فارسی، نکات کلیدی (bullet) و لینک پست است. |
+| FR-11 | بازیابی پس از کرش | در ابتدای هر اجرا، پیش از واکشی RSS جدید، سه صف باقی‌مانده خالی می‌شود: `new` (پیام ریویو تحویل نشده)، `approved` (تحلیل‌نشده) و `to_send` (منتشرنشده). هیچ‌کدام تحلیل یا پیام ریویوی دوباره نمی‌سازند. |
+| FR-12 | کانال خصوصی بررسی (گیت انسانی) | هر پست تازه یک پیام **مستقل** در `TELEGRAM_REVIEW_CHANNEL_ID` می‌گیرد (هیچ پیام تجمیعی) با دو دکمهٔ inline: `approve:<post_id>` و `reject:<post_id>`. تصمیم با یک UPDATE شرطی ثبت می‌شود (`review_status`, `reviewed_by`, `reviewed_at`, `approved_at`/`rejected_at`, `private_channel_id`, `private_message_id`). پیام ریویو **هرگز حذف نمی‌شود**: متنش به وضعیت تصمیم تغییر می‌کند و دکمه‌هایش برداشته می‌شوند. تنها idهای فهرست‌شده در `TELEGRAM_ADMIN_IDS` اجازهٔ تصمیم دارند. |
+| FR-13 | تحلیل و ترجمه پس از تأیید | فقط پست‌های `approved` به `analyze` می‌روند. نتیجه یا با دروازه‌های FR-3..FR-6 به `to_send` می‌رسد، یا `skipped_irrelevant`/`skipped_duplicate`/`skipped_low_importance` می‌شود، یا در صورت خروجی نامعتبر `failed`. `ai_processed_at` و در صورت خطا `ai_error` ثبت می‌شوند و پیام ریویو نتیجه را نشان می‌دهد. |
+| FR-14 | مدیریت موضوعات و منابع | ادمین می‌تواند موضوع بسازد، تغییر نام دهد، فعال/غیرفعال و حذف کند، و منابع را اضافه/حذف/jابجا/فعال‌غیرفعال کند و `fetch_limit` هر منبع را تعیین کند. هیچ موضوعی در کد hard-code نیست؛ تنها منبع فهرست اولیه، seed داخل `db/schema.sql` است. |
+| FR-15 | جلوگیری از تصمیم یا انتشار دوباره | گذارهای وضعیت تک‌دستوری و شرطی‌اند: `awaiting_review → approved`/`rejected` و `to_send → publishing → sent`. دومین کلیک همزمان پیام «این پست قبلاً بررسی شده است.» می‌گیرد و یک پست هرگز دو بار در کانال عمومی منتشر نمی‌شود. |
 
 ---
 
@@ -164,7 +194,7 @@
 | NFR-4 | امنیت | تمام رازها (کلید LLM، توکن تلگرام، اعتبارنامه دیتابیس) فقط از env خوانده می‌شوند؛ هرگز در کد، لاگ یا این مستندات هاردکد/چاپ نمی‌شوند. |
 | NFR-5 | قابل‌نگهداری (Maintainability) | جداسازی مسئولیت‌ها طبق ساختار پروژه (بخش ۹)؛ این مستند همیشه با کد هم‌راستا نگه داشته می‌شود (بخش ۱۴). |
 | NFR-6 | کارایی/هزینه | یک تماس LLM به‌ازای هر پست جدید؛ پردازش ترتیبی (نه موازی) چون حجم MVP کم است و از API رایگان با rate limit استفاده می‌شود. |
-| NFR-7 | قابل‌پیکربندی بودن | افزودن ساب‌ردیت/موضوع جدید، تغییر فاصله زمانی polling، یا تغییر آستانه ارسال، بدون تغییر کد و فقط با ویرایش config/env ممکن است. |
+| NFR-7 | قابل‌پیکربندی بودن | افزودن ساب‌ردیت/موضوع جدید (با دستورهای تلگرامی ادمین — FR-14)، تغییر فاصله زمانی polling، یا تغییر آستانه ارسال، بدون تغییر کد ممکن است. |
 | NFR-8 | قابلیت تست | فراخوانی‌های I/O (RSS، LLM، Telegram، DB) پشت رابط‌های نازک قرار می‌گیرند تا در تست واحد به‌سادگی mock شوند؛ منطق parsing/formatting به‌صورت تابع خالص نوشته می‌شود. |
 
 ---
@@ -174,16 +204,18 @@
 اینها اصولی هستند که **هیچ‌وقت** نباید نقض شوند. هر Agent قبل از تغییر کد باید مطمئن شود تغییرش هیچ‌کدام از این‌ها را نمی‌شکند. اگر شکستن یکی از این‌ها ضروری تشخیص داده شد، ابتدا باید همین بخش به‌روزرسانی و دلیل مستند شود.
 
 1. هر پست Reddit با `reddit_id` منحصربه‌فرد شناسایی می‌شود (از `<id>`/guid فید RSS) و **حداکثر یک‌بار** تحلیل و **حداکثر یک‌بار** به تلگرام ارسال می‌شود.
-2. یک پست فقط زمانی به تلگرام ارسال می‌شود که: (الف) `is_relevant = true`، (ب) `duplicate_of_id = null`، (ج) `importance` بالاتر یا مساوی `MIN_IMPORTANCE_TO_SEND` باشد، و (د) از قبل کامل در Postgres ذخیره شده باشد — یعنی ذخیره‌سازی همیشه قبل از تلاش برای ارسال اتفاق می‌افتد، نه بعد یا هم‌زمان.
+2. یک پست فقط زمانی در کانال عمومی منتشر می‌شود که: (الف) `review_status = 'approved'` (تأیید صریح ادمین)، (ب) `is_relevant = true`، (ج) `duplicate_of_id = null`، (د) `importance` بالاتر یا مساوی `MIN_IMPORTANCE_TO_SEND` باشد، و (ه) از قبل کامل در Postgres ذخیره شده باشد — یعنی ذخیره‌سازی همیشه قبل از تلاش برای ارسال اتفاق می‌افتد، نه بعد یا هم‌زمان.
 3. خروجی LLM همیشه در برابر مدل Pydantic تعریف‌شده در `app/models.py` اعتبارسنجی می‌شود. اگر اعتبارسنجی شکست بخورد، پست `status='failed'` می‌شود؛ **هرگز** به‌طور پیش‌فرض مرتبط/غیرتکراری فرض نمی‌شود.
 4. هر ارجاع شباهت/تکرار که LLM برمی‌گرداند، فقط از بین ایندکس‌های محلی کاندیدهایی که در همان تماس ارسال شده‌اند قابل‌قبول است؛ نگاشت ایندکس → `id` واقعی فقط در کد انجام می‌شود. خروجی خام LLM هرگز مستقیماً به‌عنوان کلید خارجی (foreign key) در دیتابیس نوشته نمی‌شود.
 5. تمام محتوای رو به کاربر در پیام تلگرام (خلاصه، نکات کلیدی، برچسب اهمیت) صرف‌نظر از زبان پست اصلی، **فارسی** است.
 6. رازها (API key ها، توکن تلگرام، اعتبارنامه DB) فقط از متغیرهای محیطی خوانده می‌شوند؛ هرگز در ریپو commit یا در لاگ چاپ نمی‌شوند.
-7. اجرای مجدد پایپ‌لاین در هر لحظه (از جمله بعد از کرش) امن است: هرگز رکورد تکراری نمی‌سازد و فقط پست‌هایی با وضعیت ناتمام ارسال (`to_send`) را دوباره تلاش می‌کند، بدون تحلیل مجدد.
+7. اجرای مجدد پایپ‌لاین در هر لحظه (از جمله بعد از کرش) امن است: هرگز رکورد تکراری نمی‌سازد و فقط کار ناتمام را ادامه می‌دهد — `new` (تحویل پیام ریویو)، `approved` (تحلیل) و `to_send` (انتشار) — بدون ساختن پیام ریویوی دوباره و بدون تحلیل مجدد پستی که منتشر شده است.
 8. هر تماس خارجی (RSS، LLM، Telegram) با تعداد تلاش محدود (`HTTP_MAX_RETRIES`) و backoff پوشش داده می‌شود؛ شکست در پردازش یک پست هرگز باعث توقف پردازش سایر پست‌های همان اجرا نمی‌شود.
 9. تغییر schema دیتابیس فقط از طریق فایل نسخه‌دار `db/schema.sql` انجام می‌شود، نه تغییر دستی روی دیتابیس در حال اجرا.
 10. اندازه‌ی فهرست کاندیدهای شباهت که به LLM داده می‌شود هرگز از `SIMILARITY_LOOKBACK_LIMIT` بیشتر نمی‌شود (برای جلوگیری از رشد نامحدود حجم/هزینه prompt).
 11. این مستند (`AGENTS.md`) و `CLAUDE.md` همیشه باید با وضعیت واقعی کد هم‌راستا باشند؛ هر تغییری در معماری، schema، مراحل pipeline، Invariantها یا قراردادهای کدنویسی، باید در همان تغییر/PR در بخش مربوطه این فایل هم اعمال شود (جزئیات: بخش ۱۴).
+12. گذارهای وضعیت **اتمیک** هستند: تصمیم ادمین و claim انتشار هر کدام یک `UPDATE ... WHERE id = %s AND status = <وضعیت انتظار>` هستند، پس از دو کلیک/دو اجرای هم‌زمان فقط یکی موفق می‌شود. هیچ گذاری نباید به صورت «خواندن وضعیت، تصمیم در پایتون، نوشتن وضعیت» پیاده شود.
+13. گیت انسانی مطلق است: هیچ پستی قبل از `approved` شدن به LLM نمی‌رود (نه ترجمه، نه خلاصه‌سازی) و هیچ پستی قبل از `approved` در کانال عمومی منتشر نمی‌شود. پیام ریویو هم **هرگز حذف نمی‌شود**؛ فقط متنش تغییر می‌کند و دکمه‌هایش برداشته می‌شود تا سابقهٔ تصمیم‌ها قابل audit بماند.
 
 ---
 
@@ -194,12 +226,11 @@
 | زبان | Python 3.11+ | خواسته صریح کاربر. |
 | دیتابیس | PostgreSQL (از طریق Docker) | خواسته صریح کاربر. |
 | RSS | `feedparser` | ساده‌ترین و پایدارترین کتابخانه پایتون برای RSS. |
-| خواندن فایل کانفیگ | `PyYAML` | تنها فایل کانفیگ غیر-env پروژه `config/topics.yaml` است؛ یک کتابخانه سبک برای خواندن آن کافی است (KISS). |
 | دسترسی به DB | `psycopg` (v3) با SQL خام، بدون ORM | یک جدول اصلی داریم؛ ORM/Migration framework (مثل Alembic) برای MVP اضافه‌بار غیرضروری است (YAGNI). Schema فقط در `db/schema.sql`. |
 | کلاینت LLM | کتابخانه رسمی `openai` (پشتیبانی از `base_url` سفارشی) | چون provider «OpenAI-compatible» است، از همان SDK استاندارد با `base_url`/`api_key`/`model` قابل‌تنظیم استفاده می‌شود؛ بدون قفل‌شدن روی یک vendor. |
 | اعتبارسنجی/تنظیمات | `pydantic` + `pydantic-settings` | اعتبارسنجی schema خروجی LLM (Invariant ۳) و خواندن config از env با type-safety. |
-| تلگرام | تماس مستقیم HTTP به Telegram Bot API (`sendMessage`) با `httpx` — بدون فریم‌ورک کامل ربات | چون فقط broadcast یک‌طرفه لازم است، فریم‌ورک‌هایی مثل `python-telegram-bot` که برای مدیریت update/polling ساخته شده‌اند غیرضروری‌اند (YAGNI). |
-| زمان‌بندی | حلقه ساده `while True: run(); sleep(...)` داخل همان پردازش | بدون وابستگی اضافه (نه APScheduler، نه cron خارجی) برای MVP. |
+| تلگرام | تماس مستقیم HTTP به Telegram Bot API با `httpx`: `sendMessage`, `editMessageText`, `answerCallbackQuery` و `getUpdates` (long-polling) — بدون فریم‌ورک ربات | دکمه‌های inline نیاز به دریافت update دارند و همه اینها چند درخواست HTTP ساده‌اند؛ فریم‌ورک‌هایی مثل `python-telegram-bot` یک حلقه و مدل دادهٔ اضافه می‌آورند (YAGNI). |
+| زمان‌بندی | یک حلقه در همان پردازش: `getUpdates` long-poll برای تصمیم‌ها + اجرای `pipeline.run_once()` هر `POLL_INTERVAL_SECONDS` | بدون وابستگی اضافه (نه APScheduler، نه cron خارجی) و بدون thread/queue؛ چون Telegram فقط به یک مصرف‌کنندهٔ `getUpdates` update می‌دهد، همین یک پردازش باید هم polling کند و هم دورهٔ RSS را نگه دارد. |
 | لاگ | ماژول استاندارد `logging`، خروجی stdout | ساده، سازگار با لاگ Docker. |
 | تست | `pytest` | استاندارد اکوسیستم پایتون. |
 | اجرا | Docker + docker-compose (سرویس `db` + سرویس `worker`) | خواسته صریح کاربر برای دیتابیس؛ اپ هم برای یکپارچگی محیط در همان compose اجرا می‌شود. |
@@ -219,27 +250,28 @@ reddit-telegram-digest/
 ├── .env.example
 ├── .gitignore                # جلوگیری از commit شدن .env و cacheها (Invariant 6)
 ├── pytest.ini                # pythonpath = . تا `pytest` از ریشه پروژه کار کند (بخش ۱۳)
-├── config/
-│   └── topics.yaml           # فهرست موضوعات مجاز + فیدهای RSS هر موضوع
 ├── db/
-│   └── schema.sql            # تنها منبع تغییر schema (بخش ۱۰)
+│   └── schema.sql            # تنها منبع تغییر schema + seed فهرست اولیه موضوعات/منابع (بخش ۱۰)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # نقطه ورود: حلقه `pipeline.run_once()` + خروج تمیز روی SIGTERM (NFR-2/NFR-3)
+│   ├── main.py                # نقطه ورود: preflight اسکیما، long-poll تصمیم‌های تلگرام، حلقه دوره‌ای `pipeline.run_once()` و خروج تمیز روی SIGTERM (NFR-2/NFR-3)
 │   ├── settings.py            # تنظیمات از env (pydantic-settings)
-│   ├── models.py              # مدل‌های Pydantic: RawPost, LlmAnalysis, PostRecord
-│   ├── reddit_source.py       # مالک config/topics.yaml + واکشی/parse RSS؛ API: load_topics_config, fetch_all, topic_display_names → FR-1
-│   ├── repository.py          # تمام پرس‌وجوهای DB؛ API: exists, save, update_status, fetch_recent_candidates, fetch_pending_to_send → FR-2, FR-4, FR-9, FR-11
+│   ├── models.py              # مدل‌های Pydantic: RawPost, TopicRecord, SourceRecord, LlmAnalysis, PostRecord
+│   ├── reddit_source.py       # واکشی/parse RSS با سقف هر منبع؛ API: fetch_all, topic_display_names → FR-1
+│   ├── repository.py          # تمام پرس‌وجوهای DB (موضوعات، منابع، پست‌ها و گذارهای اتمیک)؛ API: list_topics, list_sources, exists, save, fetch_new_reviews, mark_review_dispatched, decide_review, fetch_approved_for_analysis, record_analysis, fetch_pending_to_send, claim_for_publish, mark_published, fetch_recent_candidates, find_unusable_tables → FR-2..FR-15
 │   ├── llm_client.py          # تنها تماس خام LLM: chat_completion() روی SDK OpenAI-compatible + retry
 │   ├── prompts/
 │   │   └── analysis_prompt.md # متن prompt، جدا از کد منطق (قابل ویرایش بدون لمس کد)
 │   ├── analyzer.py            # ساخت prompt، فراخوانی chat_completion، اعتبارسنجی → analyze()/AnalysisError → FR-3..FR-8
-│   ├── telegram_notifier.py   # ارسال پیام فرمت‌شده؛ API: send_message(text) -> bool → FR-10، FR-11
+│   ├── telegram_notifier.py   # مرز کل Bot API با httpx؛ API: send_message, edit_message_text, answer_callback_query, get_updates → FR-10، FR-12
+│   ├── review.py              # گیت انسانی: تحویل به کانال خصوصی، تصمیم ✅/❌، چرخهٔ متن پیام ریویو؛ API: dispatch_pending_reviews, handle_callback → FR-12
+│   ├── telegram_updates.py    # دریافت و مسیریابی updateهای تلگرام (cursor + long-poll)؛ API: poll_once → FR-12
+│   ├── admin.py               # پنل ادمین روی تلگرام: دستورهای /topics و /sources برای مدیریت موضوعات و منابع؛ API: handle_command → FR-14
 │   ├── formatting.py          # تبدیل PostRecord به متن پیام تلگرام (فارسی)؛ API: format_message(post, topic_name=...) → FR-10
 │   ├── retry.py               # یوتیلیتی مشترک retry/backoff: دکوریتور `retryable` + موتور آن + `PermanentError` (DRY، NFR-2)
-│   └── pipeline.py            # orchestration؛ API: run_once, retry_pending_sends → FR-1..FR-11
+│   └── pipeline.py            # orchestration؛ API: run_once, process_approved_posts, retry_pending_sends → FR-1..FR-15
 └── tests/
-    ├── conftest.py             # fixtureهای مشترک (repository درون‌حافظه، LLM/Telegram جعلی، کانکشن واقعی) + دیتابیس اختصاصی تست
+    ├── conftest.py             # fixtureهای مشترک (تلگرام جعلی، کانکشن واقعی، ساخت موضوع/منبع تست) + دیتابیس اختصاصی تست
     ├── fixtures/
     │   └── reddit_learnmachinelearning.rss   # نمونهٔ واقعی (capture) از یک فید Atom ریدیت برای تست parser
     ├── test_reddit_source.py
@@ -249,68 +281,115 @@ reddit-telegram-digest/
     ├── test_telegram_notifier.py
     ├── test_llm_client.py
     ├── test_retry.py
+    ├── test_admin.py
     ├── test_main.py
     ├── test_pipeline.py
-    ├── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴)
+    ├── test_pipeline_integration.py   # end-to-end روی Postgres واقعی + فید واقعی (فاز ۴ و ۵)
     └── test_docs_consistency.py       # Invariant 11: تطبیق همین سند با کد واقعی (بخش ۱۴)
 ```
 
-هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، اطلاع‌رسانی (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
+هر ماژول **فقط یک مسئولیت** دارد (جداسازی مسئولیت‌ها): گرفتن داده (`reddit_source`)، دسترسی به داده (`repository`)، فهم محتوا (`analyzer` + `llm_client`)، گیت انسانی (`review` + `telegram_updates`)، مدیریت (`admin`)، مرز تلگرام (`telegram_notifier` + `formatting`)، و هماهنگ‌سازی (`pipeline`) کاملاً از هم جدا هستند و هرکدام مستقل قابل تست‌اند.
 
-تست‌های دیتابیسی روی یک دیتابیس **جداگانه** (`<DATABASE_URL>_test`) اجرا می‌شوند که `conftest.py` خودش می‌سازد و `db/schema.sql` را روی آن اعمال می‌کند — تا یک اجرای واقعی `docker compose up` که رکورد در دیتابیس توسعه می‌نویسد، نتیجهٔ تست‌ها را عوض نکند.
+تست‌های دیتابیسی روی یک دیتابیس **جداگانه** (`<DATABASE_URL>_test`) اجرا می‌شوند که `conftest.py` خودش می‌سازد؛ `apply_schema()` جدول‌های آن را از صفر می‌سازد (چون `CREATE TABLE IF NOT EXISTS` ستون تازه به جدول موجود اضافه نمی‌کند) و `db/schema.sql` تنها منبع ساختار است — تا یک اجرای واقعی `docker compose up` که رکورد در دیتابیس توسعه می‌نویسد، نتیجهٔ تست‌ها را عوض نکند.
 
-`repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هم تنها جای خواندن `config/topics.yaml` است، پس `settings.py` فقط env را می‌شناسد.
+`repository.py` هیچ حالت داخلی (state) نگه نمی‌دارد: هر تابع یک کانکشن کوتاه‌عمر می‌گیرد و در همان فراخوانی می‌بندد (بدون connection pool — بخش ۱۲)، و اتصال از `settings.database_url` خوانده می‌شود. `reddit_source.py` هیچ پیکربندی نمی‌خواند: ردیف‌های `sources` را از `repository` می‌گیرد، پس `settings.py` فقط env را می‌شناسد.
 
-`telegram_notifier.py` هم بدون حالت است: تابع ماژول‌سطح `send_message(text) -> bool` (نه کلاس) توکن و `TELEGRAM_CHAT_ID` را خودش از `settings` می‌خواند، تماس HTTP را با `retryable` می‌پوشاند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار `False` گزارش می‌کند — `pipeline.py` بر اساس همین مقدار بین `status='sent'` و نگه‌داشتن رکورد به‌صورت `to_send` برای دور بعد (FR-11) تصمیم می‌گیرد. به همین دلیل `main.py` هیچ نوتيفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: دو تابع ماژول‌سطح `run_once()` و `retry_pending_sends()` که هرکدام تنظیمات و موضوعات خودشان را می‌خوانند (`main.py` فقط `pipeline.run_once()` را در حلقه صدا می‌زند). تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
+`telegram_notifier.py` هم بدون حالت است: چند تابع ماژول‌سطح (نه کلاس) توکن را خودشان از `settings` می‌خوانند، هر تماس HTTP را با `retryable` می‌پوشانند (Invariant 8) و شکست عادی تلگرام را به‌جای exception با مقدار گزارش می‌کنند (`send_message` → `message_id` یا `None`، `get_updates` → لیست خالی) — تا `pipeline`/`review` تصمیم بگیرند و هیچ خطایی حلقهٔ worker را نکشد. `review.py` تنها جای تصمیم‌گیری انسانی است (تحویل به کانال خصوصی، اعتبارسنجی ادمین، گذار اتمیک، ویرایش متن پیام) و `telegram_updates.py` تنها جای خواندن update. `admin.py` (پنل ادمین) هم بدون حالت است: هر دستور یک خط، هر دستور یک پاسخ فارسی، و هیچ conversation state یا منویی نگه نمی‌دارد؛ فقط برای idهای داخل `TELEGRAM_ADMIN_IDS` پاسخ می‌دهد. `main.py` هیچ نوتیفایری نمی‌سازد و `pipeline.py` هم کلاس/حالت ندارد: `run_once()`، `process_approved_posts()` و `retry_pending_sends()` تنظیمات و موضوعات خودشان را می‌خوانند. تست‌ها با monkeypatch همان توابع همکار (`fetch_all`/`analyze`/`send_message`) را جابه‌جا می‌کنند (NFR-8).
 
 ---
 
 ## ۱۰. Schema دیتابیس
 
-تنها جدول مورد نیاز MVP. هر تغییر در این schema باید هم در `db/schema.sql` و هم در این بخش اعمال شود.
+سه جدول: موضوعات و منابع (داده‌ای که ادمین با دستورهای تلگرام مدیریت می‌کند) و پست‌ها. هر تغییر در این schema باید هم در `db/schema.sql` و هم در این بخش اعمال شود.
 
 ```sql
+CREATE TABLE IF NOT EXISTS topics (
+    id          BIGSERIAL PRIMARY KEY,
+    key         TEXT NOT NULL UNIQUE,                -- همان مقداری که LLM به‌عنوان topic برمی‌گرداند (FR-5)
+    name        TEXT NOT NULL,                       -- برچسب فارسی پیام تلگرام (Invariant 5)
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+    id          BIGSERIAL PRIMARY KEY,
+    topic_id    BIGINT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+    rss_url     TEXT NOT NULL UNIQUE,
+    fetch_limit INTEGER CHECK (fetch_limit IS NULL OR fetch_limit > 0),  -- NULL → RSS_FETCH_LIMIT
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS posts (
     id                  BIGSERIAL PRIMARY KEY,
     reddit_id           TEXT NOT NULL UNIQUE,        -- guid فید RSS، مثلا t3_1abcde
     subreddit           TEXT NOT NULL,
-    source_topic_key    TEXT NOT NULL,               -- کلید موضوع منبع از config/topics.yaml
+    source_topic_key    TEXT NOT NULL,               -- کلید موضوع در زمان واکشی (FK نیست تا حذف موضوع سابقه را نکشد)
     title               TEXT NOT NULL,
     url                 TEXT NOT NULL,
     author              TEXT,
     raw_content         TEXT,                        -- متن/خلاصه خام از RSS
-    published_at        TIMESTAMPTZ,
+    posted_at           TIMESTAMPTZ,                 -- زمان انتشار پست در ریدیت (از RSS)
     fetched_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    -- خروجی تحلیل LLM
-    is_relevant         BOOLEAN,
-    duplicate_of_id     BIGINT REFERENCES posts(id),
-    topic               TEXT,                        -- موضوع تایید شده توسط LLM (از فهرست مجاز)
-    importance          TEXT CHECK (importance IN ('low','medium','high')),
-    summary_fa          TEXT,
-    key_points          JSONB,                       -- ["نکته ۱", "نکته ۲", ...]
-    llm_raw_response    JSONB,                       -- خروجی خام LLM برای audit/دیباگ
 
     status              TEXT NOT NULL DEFAULT 'new'
                         CHECK (status IN (
-                            'new', 'skipped_irrelevant', 'skipped_duplicate',
-                            'skipped_low_importance', 'to_send', 'sent', 'failed'
+                            'new', 'awaiting_review', 'approved', 'rejected',
+                            'skipped_irrelevant', 'skipped_duplicate',
+                            'skipped_low_importance', 'to_send', 'publishing',
+                            'sent', 'failed'
                         )),
-    sent_at             TIMESTAMPTZ,
+    review_status       TEXT NOT NULL DEFAULT 'pending_review'
+                        CHECK (review_status IN ('pending_review', 'approved', 'rejected')),
+
+    -- سابقهٔ تصمیم انسانی (FR-12)
+    reviewed_by         TEXT,                        -- id تلگرامی ادمین تصمیم‌گیرنده
+    reviewed_at         TIMESTAMPTZ,
+    approved_at         TIMESTAMPTZ,
+    rejected_at         TIMESTAMPTZ,
+    private_channel_id  TEXT,
+    private_message_id  BIGINT,
+
+    -- خروجی تحلیل LLM (فقط پس از تأیید پر می‌شود، FR-13)
+    is_relevant         BOOLEAN,
+    duplicate_of_id     BIGINT REFERENCES posts(id),
+    topic               TEXT,
+    importance          TEXT CHECK (importance IN ('low','medium','high')),
+    summary_fa          TEXT,
+    key_points          JSONB,                       -- ["نکته ۱", "نکته ۲", ...]
+    llm_raw_response    JSONB,
+    ai_processed_at     TIMESTAMPTZ,
+    ai_error            TEXT,
+
+    -- انتشار
+    public_channel_id   TEXT,
+    public_message_id   BIGINT,
+    published_at        TIMESTAMPTZ,                 -- زمان انتشار ما در کانال عمومی
+
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE INDEX IF NOT EXISTS idx_sources_topic_id    ON sources (topic_id);
 CREATE INDEX IF NOT EXISTS idx_posts_status        ON posts (status);
-CREATE INDEX IF NOT EXISTS idx_posts_published_at  ON posts (published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_review_status ON posts (review_status);
+CREATE INDEX IF NOT EXISTS idx_posts_posted_at     ON posts (posted_at DESC);
 ```
 
-**نکات مهم درباره status:**
-- `new` → رکورد تازه (در عمل معمولاً خیلی کوتاه‌عمر است چون بلافاصله تحلیل می‌شود).
-- `skipped_irrelevant` / `skipped_duplicate` → تحلیل شده اما ارسال نمی‌شود؛ رکورد برای جلوگیری از پردازش مجدد نگه داشته می‌شود.
-- `skipped_low_importance` → پست مرتبط و غیرتکراری است، اما `importance` آن کمتر از `MIN_IMPORTANCE_TO_SEND` است (FR-10 شرط ج). عمداً از `skipped_irrelevant` جدا نگه داشته می‌شود تا وقتی آستانه سخت‌گیرانه‌تر می‌شود، پست‌های مرتبطِ کم‌اهمیت با پست‌های نامرتبط در دیتابیس قاطی نشوند.
-- `to_send` → تحلیل کامل شده، منتظر ارسال (یا ارسال قبلی ناموفق بوده و باید دوباره تلاش شود — FR-11).
+**نکات مهم درباره `status` (وضعیت ماشین):**
+- `new` → ذخیره شده، پیام ریویو هنوز تحویل نشده (دور بعد دوباره تلاش می‌شود).
+- `awaiting_review` → پیام در کانال خصوصی تحویل شده و منتظر تصمیم ادمین است.
+- `approved` → ادمین تأیید کرده و نوبت LLM است؛ فقط همین وضعیت وارد `analyze` می‌شود (Invariant 13).
+- `rejected` → نهایی؛ نه LLM، نه ترجمه، نه انتشار (FR-12).
+- `skipped_irrelevant` / `skipped_duplicate` → تحلیل شده اما منتشر نمی‌شود؛ رکورد برای جلوگیری از پردازش مجدد نگه داشته می‌شود.
+- `skipped_low_importance` → پست مرتبط و غیرتکراری است، اما `importance` آن کمتر از `MIN_IMPORTANCE_TO_SEND` است (FR-10 شرط د). عمداً از `skipped_irrelevant` جدا نگه داشته می‌شود تا وقتی آستانه سخت‌گیرانه‌تر می‌شود، پست‌های مرتبطِ کم‌اهمیت با پست‌های نامرتبط در دیتابیس قاطی نشوند.
+- `to_send` → تحلیل کامل شده، منتظر انتشار (یا ارسال قبلی ناموفق بوده و باید دوباره تلاش شود — FR-11).
+- `publishing` → claim انتشار گرفته شده (Invariant 12). معمولاً چند صد میلی‌ثانیه می‌ماند؛ اگر پروسه بین «تلگرام قبول کرد» و «ثبت `sent`» کرش کند، باقی می‌ماند و نیاز به بررسی دستی دارد — این عمدی است، چون گزینهٔ دیگر «انتشار دوبارهٔ همان پست» است.
 - `sent` → نهایی، موفق.
-- `failed` → خروجی LLM معتبر نبود یا خطای غیرقابل‌ریکاوری رخ داد؛ نیاز به بررسی دستی/لاگ دارد.
+- `failed` → خروجی LLM معتبر نبود؛ دلیلش در `ai_error` است و نیاز به بررسی دستی/لاگ دارد.
+
+**نکات مهم درباره `review_status` (تصمیم انسانی):** این ستون عمداً از `status` جدا است تا سابقهٔ تصمیم حتی وقتی وضعیت ماشین جلوتر رفته قابل خواندن باشد: `pending_review` → `approved` یا `rejected`، همیشه همراه با `reviewed_by`/`reviewed_at` و یکی از `approved_at`/`rejected_at`. گذار اتمیک است و یک ردیف فقط یک بار از `pending_review` بیرون می‌آید.
 
 ---
 
@@ -330,9 +409,12 @@ OPENAI_MODEL=
 # تلگرام
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+TELEGRAM_REVIEW_CHANNEL_ID=
+TELEGRAM_ADMIN_IDS=
 
 # رفتار پایپ‌لاین
 POLL_INTERVAL_SECONDS=900
+RSS_FETCH_LIMIT=25
 SIMILARITY_LOOKBACK_LIMIT=50
 SIMILARITY_LOOKBACK_HOURS=72
 MIN_IMPORTANCE_TO_SEND=low
@@ -347,26 +429,34 @@ LOG_LEVEL=INFO
 | `OPENAI_BASE_URL` | آدرس base؛ برای provider رایگان جایگزین تغییر می‌کند | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | نام مدل | ندارد (اجباری، وابسته به provider) |
 | `TELEGRAM_BOT_TOKEN` | توکن ربات (از BotFather) | ندارد (اجباری) |
-| `TELEGRAM_CHAT_ID` | شناسه چت/کانال مقصد broadcast | ندارد (اجباری) |
+| `TELEGRAM_CHAT_ID` | شناسهٔ کانال عمومی (مقصد انتشار نهایی) | ندارد (اجباری) |
+| `TELEGRAM_REVIEW_CHANNEL_ID` | شناسهٔ کانال خصوصی بررسی (محل تصمیم ادمین) | ندارد (اجباری) |
+| `TELEGRAM_ADMIN_IDS` | فهرست comma-separated شناسهٔ کاربری ادمین‌ها؛ تنها این‌ها می‌توانند ✅/❌ بزنند و دستور اجرا کنند. خالی = هیچ‌کس | خالی |
 | `POLL_INTERVAL_SECONDS` | فاصله هر دور واکشی RSS | 900 |
+| `RSS_FETCH_LIMIT` | سقف پیش‌فرض تعداد پست هر منبع در هر اجرا؛ `fetch_limit` منبع آن را بازنویسی می‌کند | 25 |
 | `SIMILARITY_LOOKBACK_LIMIT` | حداکثر تعداد پست کاندید برای تشخیص شباهت | 50 |
 | `SIMILARITY_LOOKBACK_HOURS` | بازه زمانی انتخاب کاندیدها | 72 |
 | `MIN_IMPORTANCE_TO_SEND` | حداقل اهمیت لازم برای ارسال (`low`/`medium`/`high`) | `low` |
 | `HTTP_MAX_RETRIES` | حداکثر تعداد تلاش کل هر تماس خارجی (شامل تلاش اول؛ backoff نمایی بین تلاش‌ها) | 3 |
 | `LOG_LEVEL` | سطح لاگ | `INFO` |
 
-فایل `config/topics.yaml` (فهرست واقعی فعلی — دو ساب‌ردیت کم‌ترافیک که در فاز ۴ انتخاب شدند، بخش ۱۵):
+seed داخل `db/schema.sql` (فهرست اولیهٔ موضوعات و فیدها — دو ساب‌ردیت کم‌ترافیک که در فاز ۴ انتخاب شدند، بخش ۱۵). این SQL فقط در اولین بوت روی دیتابیس خالی اجرا می‌شود؛ از آن به بعد ادمین همین داده را با دستورهای تلگرام مدیریت می‌کند و هیچ فایل کانفیگی برای موضوعات وجود ندارد (FR-14):
 
-```yaml
-topics:
-  - key: ai
-    name: "هوش مصنوعی"
-    feeds:
-      - "https://www.reddit.com/r/mlops/new/.rss"
-  - key: startup
-    name: "استارتاپ"
-    feeds:
-      - "https://www.reddit.com/r/venturecapital/new/.rss"
+```sql
+INSERT INTO topics (key, name) VALUES
+    ('ai', 'هوش مصنوعی'),
+    ('startup', 'استارتاپ')
+ON CONFLICT (key) DO NOTHING;
+
+INSERT INTO sources (topic_id, rss_url)
+SELECT seed_topic.id, seed.rss_url
+FROM (
+    VALUES
+        ('ai', 'https://www.reddit.com/r/mlops/new/.rss'),
+        ('startup', 'https://www.reddit.com/r/venturecapital/new/.rss')
+) AS seed(topic_key, rss_url)
+JOIN topics AS seed_topic ON seed_topic.key = seed.topic_key
+ON CONFLICT (rss_url) DO NOTHING;
 ```
 
 ---
@@ -383,11 +473,35 @@ topics:
 - **فقط خطاهای گذرا retry می‌شوند**: status‌های 4xx (به‌جز 429) یعنی «درخواست خودش غلط است» (توکن/کلید نامعتبر، چت ناشناس، فید ۴۰۴) و در تلاش بعدی هم همان جواب را می‌گیرند؛ چنین مواردی باید `PermanentError` از `retry.py` را raise کنند تا موتور retry فوراً بالا برود و بودجهٔ تلاش و sleepهای backoff هدر نرود. برای 429 انتظار `Retry-After` (با سقف `MAX_RETRY_AFTER_SECONDS` در `reddit_source.py`) رعایت می‌شود.
 - **خطای دائمی در سطح APIهای عمومی هم بدون تغییر رفتار دیده شود**: `telegram_notifier.send_message` همچنان `False` برمی‌گرداند و `llm_client` همچنان `LlmError` می‌دهد؛ فقط تعداد تلاش‌ها کم می‌شود.
 - **اعتبارسنجی خروجی LLM**: همیشه با مدل Pydantic در `app/models.py`؛ هرگز دسترسی مستقیم به دیکشنری JSON خام در جاهای دیگر کد.
-- **پیام تلگرام**: با `parse_mode=HTML` (نه MarkdownV2) برای escaping ساده‌تر؛ محتوای آمده از پست/جدول با `html.escape(..., quote=False)` فرار داده می‌شود (فقط `<`, `>`, `&` — کوتیشن هرگز داخل صفت HTML نمی‌رود). ساخت پیام تنها در `formatting.format_message` انجام می‌شود.
+- **پیام تلگرام**: با `parse_mode=HTML` (نه MarkdownV2) برای escaping ساده‌تر؛ محتوای آمده از پست/جدول با `html.escape(..., quote=False)` فرار داده می‌شود (فقط `<`, `>`, `&` — کوتیشن هرگز داخل صفت HTML نمی‌رود). ساخت پیام انتشار تنها در `formatting.format_message` و ساخت متن پیام ریویو تنها در `review.format_review_message` انجام می‌شود.
+- **گذارهای وضعیت**: تصمیم ادمین و claim انتشار هر کدام **یک** `UPDATE ... WHERE id = %s AND status = <مقدار مورد انتظار>` هستند و مقدار بازگشتی همان `bool` «من برنده شدم» است (Invariant 12). هرگز وضعیت را در پایتون بخوانید، تصمیم بگیرید و بنویسید — این الگو در حضور دو کلیک همزمان غلط است.
 - **لاگ**: هرگز مقدار خام کلید/توکن در لاگ چاپ نشود؛ لاگ‌ها ساخت‌یافته و شامل `reddit_id` برای ردیابی باشند. این قانون فقط به پیام‌های خود کد محدود نیست: لاگرهای کتابخانه‌های transport (`httpx`, `httpcore`, `openai`) در `main.setup_logging` روی `WARNING` قفل می‌شوند، چون httpx آدرس کامل درخواست را لاگ می‌کند و آدرس تلگرام خودِ توکن را در مسیر دارد (`/bot<TOKEN>/sendMessage`) و در سطح DEBUG هدرها (شامل کلید LLM) را هم چاپ می‌کند.
-- **تست**: تست‌های واحد هیچ تماس شبکه واقعی نمی‌زنند (RSS/LLM/Telegram/DB mock می‌شوند). منطق خالص (parsing، فرمت پیام، اعتبارسنجی schema) اولویت پوشش تست دارد.
+- **تست**: تست‌ها هیچ تماس شبکه واقعی نمی‌زنند (RSS/LLM/Telegram جعلی می‌شوند، NFR-8). ذخیره‌سازی اما جعلی نیست: جریان ریویو/انتشار یک ماشین حالت روی SQL شرطی است، پس `test_pipeline.py` و `test_repository.py` روی Postgres واقعی اجرا می‌شوند. منطق خالص (parsing، فرمت پیام، اعتبارسنجی schema) با تست واحد پوشش داده می‌شود.
+- **updateهای تلگرام**: فقط از `telegram_updates.poll_once` خوانده می‌شوند (تنها جای cursor/`update_id`) و هر update فقط به ماژولی که مالک آن است مسیر می‌شود؛ هر update ناشناخته بی‌صدا نادیده می‌رود. یک خطای پردازش یک update نباید حلقه را متوقف کند، و cursor فقط بعد از پردازش جلو می‌رود.
 
-### قالب پیام تلگرام (`app/formatting.py`)
+### قالب پیام ریویو (`app/review.py`)
+
+پیام قبل از هر پردازش AI (بدون خلاصه، چون هنوز LLM اجرا نشده) ساخته می‌شود:
+
+```
+🆕 پست جدید برای بررسی
+
+📌 <b>{title}</b>
+
+r/{subreddit} • {topic} • 🆔 <code>{id}</code>
+
+✍️ u/{author}
+🕒 {posted_at} UTC
+
+{raw_content، بریده‌شده در ۱۲۰۰ کاراکتر}
+
+🔗 {url}
+```
+
+و دو دکمهٔ inline که با `post_id` به همان ردیف اشاره می‌کنند: `approve:{id}` و `reject:{id}`. پس از تصمیم، **همین پیام** ویرایش می‌شود (حذف نمی‌شود) و دکمه‌ها برداشته می‌شوند:
+`✅ تأیید شد / 📤 در حال پردازش...` → `✅ تأیید شد / 📤 با موفقیت در کانال عمومی منتشر شد`، یا `❌ این پست تأیید نشد.`
+
+### قالب پیام انتشار (`app/formatting.py`)
 
 ```
 📌 <b>{title}</b>
@@ -403,7 +517,7 @@ r/{subreddit} • {topic} • اهمیت: {importance_fa}
 ```
 
 - `importance_fa`: `low`→«کم»، `medium`→«متوسط»، `high`→«بالا»؛ مقدار نامعتبر یا `None`→«نامشخص».
-- `{topic}` نام فارسی موضوع از `config/topics.yaml` است؛ اگر در دسترس نباشد، همان کلید موضوع نمایش داده می‌شود (نه یک رشته انگلیسی خام).
+- `{topic}` نام فارسی موضوع از جدول `topics` می‌آید (کلید `topic` تحلیل، یا در نبود آن `source_topic_key`)؛ اگر در دسترس نباشد، همان کلید موضوع نمایش داده می‌شود (نه یک رشته انگلیسی خام).
 - اگر `key_points` خالی/`None` باشد، بخش «نکات کلیدی» کلاً حذف می‌شود.
 - `format_message` تضمین می‌کند کل پیام از حد تلگرام (۴۰۹۶ کاراکتر) رد نشود؛ در صورت نیاز ابتدا `summary_fa` با «…» کوتاه می‌شود.
 
@@ -418,10 +532,13 @@ Docker و docker-compose نصب باشند.
 ```bash
 cp .env.example .env
 # مقداردهی OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
-# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID در .env
+# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (کانال عمومی),
+# TELEGRAM_REVIEW_CHANNEL_ID (کانال خصوصی) و TELEGRAM_ADMIN_IDS در .env
 
 docker compose up --build
 ```
+
+نکتهٔ عملیاتی: ربات باید در کانال خصوصی **ادمین** باشد (تا بتواند پیام بفرستد و بعداً همان پیام را ویرایش/دکمه‌هایش را بردارد) و در کانال عمومی اجازهٔ ارسال داشته باشد. برای پیدا کردن شناسه‌ها، یک‌بار `https://api.telegram.org/bot<TOKEN>/getUpdates` را بزنید (فقط برای پیدا کردن شناسه؛ هیچ منطق polling دستی در کد نیست). `TELEGRAM_ADMIN_IDS` را خالی نگذارید وگرنه هیچ‌کس نمی‌تواند تأیید کند و پست‌ها در `awaiting_review` می‌مانند.
 
 ### سرویس‌های compose
 دو سرویس وجود دارد و تعریف واقعی آن‌ها فقط در `docker-compose.yml` نگه داشته می‌شود (تکرارش این‌جا یعنی دو جا برای drift داشتن):
@@ -431,18 +548,31 @@ docker compose up --build
 - `worker`: همان ایمیج پایتون (`Dockerfile`)، `env_file: .env`، و `depends_on` با شرط
   `service_healthy` تا هیچ دوری قبل از آماده بودن دیتابیس شروع نشود.
 
-نکتهٔ عملیاتی: `db/schema.sql` فقط زمانی خودکار اعمال می‌شود که volume دیتابیس خالی باشد؛
-اگر بعداً schema تغییر کرد، یا آن را دستی روی دیتابیس اجرا کنید یا `docker compose down -v`
-را آگاهانه بزنید (Invariant 9: هیچ تغییر schema بیرون از `db/schema.sql` مجاز نیست).
+نکتهٔ عملیاتی: `db/schema.sql` فقط زمانی خودکار اعمال می‌شود که volume دیتابیس خالی باشد
+(Invariant 9: هیچ تغییر schema بیرون از `db/schema.sql` مجاز نیست). برای دیتابیسی که از فاز
+قبلی مانده، اجرای دستی فایل کافی **نیست** چون `CREATE TABLE IF NOT EXISTS` جدول موجود با
+ستون‌های قدیمی را دست نمی‌زند؛ راه درست ساختن volume تازه است:
+
+```bash
+docker compose down -v && docker compose up -d --build
+```
+
+برای اینکه این اشتباه ساکت نماند، `main.preflight()` در استارتاپ سه جدول `topics`/`sources`/
+`posts` را با همان لیست ستون‌های خواندهٔ واقعی تست می‌کند و در صورت ناسازگاری با یک پیام صریح
+(شامل همین دستور) خارج می‌شود. اندازه‌گیری واقعی روی volume همان فاز ۴: قبلاً هر دور با
+`UndefinedTable: relation "topics" does not exist` می‌مرد و `worker` سالم به‌نظر می‌رسید ولی
+هیچ کاری نمی‌کرد؛ حالا استارتاپ با یک خط قابل‌اقدام می‌شکند (NFR-3).
 
 ### اجرای تست‌ها
 ```bash
 pip install -r requirements.txt
 pytest
 ```
-تست‌های دیتابیس (`tests/test_repository.py`، بخش «real storage» در `tests/test_pipeline.py` و `tests/test_pipeline_integration.py`) integration هستند و روی یک Postgres واقعی اجرا می‌شوند؛ اگر دیتابیسی بالا نباشد، خودشان را با یک پیام روشن skip می‌کنند. برای اجرای کامل: `docker compose up -d db` و سپس `pytest`.
+تست‌های دیتابیس (`tests/test_repository.py`، `tests/test_pipeline.py` و `tests/test_pipeline_integration.py`) integration هستند و روی یک Postgres واقعی اجرا می‌شوند؛ اگر دیتابیسی بالا نباشد، خودشان را با یک پیام روشن skip می‌کنند. برای اجرای کامل: `docker compose up -d db` و سپس `pytest`.
 
-این تست‌ها روی دیتابیس اختصاصی `<DATABASE_URL>_test` اجرا می‌شوند (نه دیتابیس توسعه): `conftest.py` آن را در صورت نبودن می‌سازد و `db/schema.sql` را رویش اعمال می‌کند. بنابراین اجرای واقعی سرویس `worker` روی دیتابیس توسعه، تست‌ها را خراب نمی‌کند.
+این تست‌ها روی دیتابیس اختصاصی `<DATABASE_URL>_test` اجرا می‌شوند (نه دیتابیس توسعه): `conftest.py` آن را در صورت نبودن می‌سازد و جدول‌هایش را از صفر از `db/schema.sql` می‌سازد (چون `CREATE TABLE IF NOT EXISTS` ستون تازه اضافه نمی‌کند، یک دیتابیس تست قدیمی در غیر این صورت ساکت می‌شکند). بنابراین اجرای واقعی سرویس `worker` روی دیتابیس توسعه، تست‌ها را خراب نمی‌کند.
+
+نکتهٔ عملیاتی (Invariant 9): برای دیتابیس **توسعه**، `db/schema.sql` مهاجرت نیست؛ اگر از یک نسخهٔ قبلی بالا آمده و تغییر schema داشته‌اید، یا خود فایل را روی آن اجرا کنید یا `docker compose down -v` را آگاهانه بزنید.
 
 ---
 
@@ -463,11 +593,11 @@ pytest
 
 این‌ها چیزهایی هستند که برای شروع پیاده‌سازی واقعی لازم‌اند و در این سند فقط با مقدار نمونه/placeholder پر شده‌اند:
 
-- ~~**فهرست واقعی ساب‌ردیت‌ها/موضوعات**~~ — انجام شد (فاز ۴): دو فید کم‌ترافیک واقعی در `config/topics.yaml` قرار گرفتند (`r/mlops` ≈۳ پست/روز و `r/venturecapital` ≈۰.۴ پست/روز، هر دو اندازه‌گیری‌شده روی فید زنده) تا هزینهٔ LLM و طول هر دور polling قابل پیش‌بینی بماند. افزودن فید پرترافیک‌تر فقط یک خط YAML است.
-- **نام/آدرس دقیق provider رایگان OpenAI-compatible** (مثلاً OpenRouter، Groq، یا مورد دیگر) و مدل مشخص، برای مقداردهی `OPENAI_BASE_URL` و `OPENAI_MODEL`. **باز است**: تا این لحظه provider/مدل واقعی انتخاب نشده و نام آن در این سند ثبت نشده — طبق قانون بخش ۱۴ دو مقدار حدسی نمی‌نویسیم؛ به‌محض انتخاب، فقط نام provider و مدل (بدون هیچ کلیدی، Invariant 6) همین‌جا اضافه می‌شود.
-- **توکن ربات تلگرام** (از BotFather) و **`TELEGRAM_CHAT_ID`** مقصد. **باز است** و به‌صورت `[REPLACE]` در `.env` (که commit نمی‌شود) قرار دارد؛ هیچ‌وقت در این سند یا کد نوشته نمی‌شود (Invariant 6).
-- **ارسال واقعی انتها-به-انتها**: مسیر RSS→Postgres→تصمیم status/`sent_at` و چند دور polling و خروج تمیز روی `docker stop` واقعاً در Docker اجرا و تأیید شده‌اند (فاز ۴)، اما یک ارسال واقعی به تلگرام با توکن واقعی و یک پاسخ واقعی provider هنوز تأیید نشده چون به مقداردهی واقعی `.env` نیاز دارد.
-- تایید اینکه آستانه پیش‌فرض `MIN_IMPORTANCE_TO_SEND=low` (ارسال همه پست‌های مرتبط) مطلوب است یا کاربر از ابتدا می‌خواهد سخت‌گیرتر باشد (`medium`/`high`). **باز است**؛ در README مسیر تغییر یک‌خطی‌اش توضیح داده شده است.
+- ~~**فهرست واقعی ساب‌ردیت‌ها/موضوعات**~~ — انجام شد (فاز ۴ و ۵): دو فید کم‌ترافیک واقعی (`r/mlops` ≈۳ پست/روز و `r/venturecapital` ≈۰.۴ پست/روز، هر دو اندازه‌گیری‌شده روی فید زنده) اکنون در `db/schema.sql` seed می‌شوند و از آن به بعد ادمین آن‌ها را با دستورهای تلگرام مدیریت می‌کند (FR-14)؛ افزودن فید/موضوع جدید هیچ تغییر کدی نمی‌خواهد.
+- **نام/آدرس provider رایگان OpenAI-compatible و مدل**: در `.env` محلی (که commit نمی‌شود) مقداردهی شده است — یک endpoint سازگار با OpenAI از Google Gemini (`OPENAI_MODEL=gemini-3.1-flash-lite`). هیچ کلیدی این‌جا نوشته نمی‌شود (Invariant 6)؛ اگر provider/مدل عوض شد، فقط همین یک جمله و همان دو مقدار در `.env` تغییر می‌کند.
+- **توکن ربات تلگرام** (از BotFather) و شناسهٔ دو مقصد (`TELEGRAM_CHAT_ID` کانال عمومی و `TELEGRAM_REVIEW_CHANNEL_ID` کانال خصوصی بررسی) و `TELEGRAM_ADMIN_IDS`. **باز است**: در `.env` محلی قرار دارند و هیچ‌وقت در این سند یا کد نوشته نمی‌شوند (Invariant 6). چت/کانال خصوصی بررسی باید توسط کاربر ساخته شود و ربات در آن ادمین باشد.
+- **ارسال واقعی انتها-به-انتها**: مسیر RSS→Postgres→تصمیم status و چند دور polling و خروج تمیز روی `docker stop` واقعاً در Docker اجرا و تأیید شده‌اند (فاز ۴). حلقهٔ جدید فاز ۵ (پیام ریویو + کلیک ✅/❌ + انتشار در کانال عمومی) هنوز با یک توکن و کانال واقعی اجرا نشده و باید یک‌بار به‌صورت زنده آزمایش شود.
+- تایید اینکه آستانه پیش‌فرض `MIN_IMPORTANCE_TO_SEND=low` (انتشار همهٔ پست‌های تأییدشده و مرتبط) مطلوب است یا کاربر از ابتدا می‌خواهد سخت‌گیرتر باشد (`medium`/`high`). **باز است**؛ در README مسیر تغییر یک‌خطی‌اش توضیح داده شده است.
 
 ---
 
@@ -514,3 +644,20 @@ pytest
   2. **رنج تعداد `key_points` (۲ تا ۵ در FR-8) در prompt اعمال می‌شود، نه در اعتبارسنجی**: بخش‌های ۵ و ۱۲ همین سند هم به همین شکل اصلاح شدند. دلیل: Invariant 3 باید خروجی *غیرقابل‌اعتماد* را رد کند، و «۶ نکته» غیرقابل‌اعتماد نیست؛ سخت‌گیری این‌جا یک پست معتبر را `failed` می‌کرد و خلاصهٔ مفید را از دست می‌داد.
   3. **README به راهنمای کاربر نهایی و خودکفا تبدیل شد** (پیش‌نیازها، تنظیم `OPENAI_*`/تلگرام، تأیید کارکرد، افزودن ساب‌ردیت/موضوع، توقف، عیب‌یابی) و عمداً FR/NFR/Invariant و نقشهٔ ماژول‌ها را تکرار نمی‌کند بلکه به بخش‌های ۵، ۷، ۹، ۱۱ و ۱۲ همین سند ارجاع می‌دهد (DRY).
   همچنین در همین فاز پوشش تست مسیرهای خطای جامانده تکمیل شد: فید بدون `published_at` و فید بدون پاسخ (timeout) در `reddit_source`، رفتار `save()` روی `reddit_id` تکراری و بدون بازنویسی تحلیل قبلی در `repository`، شکست API بعد از تمام تلاش‌ها/پاسخ بدون `choices`/بودجهٔ یک‌تلاشی در `llm_client`، و مرزهای `truncate` و رندر هر تعداد نکته در `formatting`. سقف‌های عددی (مثل `len(columns) == 20`) هم داخل تست‌های ممیزی گذاشته شد تا اگر regex خالی برگرداند، تست به‌جای سبز شدنِ الکی شکست بخورد. هیچ Invariant‌ای تغییر نکرد، `db/schema.sql` و `config/topics.yaml` دست‌نخورده ماندند (فهرست فیدها در فاز ۴-A نهایی شد) و هیچ وابستگی جدیدی اضافه نشد.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — موضوعات/منابع به دیتابیس + سقف واکشی قابل‌تنظیم)** — دو خواستهٔ صریح کاربر این دو را از «کد» به «داده» منتقل کرد: (۱) تعداد پست هر اجرا نباید عدد ثابتی مثل ۲۵ باشد و (۲) موضوعات نباید hard-code باشند:
+  1. **دو جدول تازه `topics` و `sources`** (بخش ۱۰) با CRUD کامل در `repository` (FR-14). موضوعات قبلی در `config/topics.yaml` بودند و مالکیت‌شان در `reddit_source` قرار داشت؛ حالا DB تنها منبع حقیقت است و فایل YAML حذف شد — به همین دلیل **وابستگی `PyYAML` از stack حذف شد** (بخش ۸) و `reddit_source` دیگر هیچ پیکربندی نمی‌خواند: ردیف‌های `sources` را از بیرون می‌گیرد.
+  2. **سقف واکشی هر منبع** (FR-1): `RSS_FETCH_LIMIT` (پیش‌فرض ۲۵) سقف پیش‌فرض است و هر منبع `fetch_limit` خودش را دارد؛ تعداد واقعی همیشه `min(سقف, تعداد آیتم‌های موجود)` است — تنظیم ۵۰ روی فیدی با ۱۷ آیتم فقط ۱۷ پست می‌دهد. عدد ۲۵ فقط یک پیش‌فرض تنظیم‌پذیر است و در هیچ منطقی hard-code نشده.
+  3. **فهرست اولیه** (همان دو فید کم‌ترافیک فاز ۴) با `INSERT ... ON CONFLICT DO NOTHING` داخل `db/schema.sql` seed می‌شود تا فقط در اولین بوت اجرا شود و DRY حفظ شود؛ یک تست ممیزی همین seed را با بخش ۱۱ مقایسه می‌کند.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — گیت انسانی: کانال خصوصی، تأیید/رد، انتشار)** — خواستهٔ صریح کاربر: هیچ پستی نباید قبل از تأیید ادمین وارد LLM شود و هر پست باید یک پیام مستقل با دکمه‌های ✅/❌ در یک کانال خصوصی بگیرد. این تغییر بزرگ‌ترین تغییر منبع حقیقت تا امروز بود، چون چند بند بخش‌های ۲/۳/۸ را عمداً منسوخ کرد:
+  1. **پایپ‌لاین دیگر یک‌جهته نیست** (TL;DR و بخش ۲ و ۳): کانال ارسال از یکی به دو تا رسید (کانال خصوصی بررسی + کانال عمومی) و «پنل مدیریت/دستورات ربات» که در بخش ۲ خارج از دامنه بود داخل دامنه آمد — به‌صورت دستورهای تلگرامی ادمین، بدون رابط وب و بدون احراز هویت جداگانه (هویت از `TELEGRAM_ADMIN_IDS`).
+  2. **دریافت update از تلگرام** (بخش ۳ و ۸): دکمه‌های inline بدون `getUpdates` کار نمی‌کنند، پس جملهٔ «نیازی به polling برای updateهای ورودی نیست» حذف شد. این کار با همان `httpx` و بدون فریم‌ورک ربات انجام می‌شود و حلقهٔ `main` بین long-poll و دور دوره‌ای RSS مشترک است (بدون thread/queue).
+  3. **دو ماژول تازه**: `review.py` (تحویل به کانال خصوصی، اعتبارسنجی ادمین، اعمال تصمیم، ویرایش متن پیام) و `telegram_updates.py` (فقط cursor و مسیریابی updateها)؛ `telegram_notifier.py` از «فقط `sendMessage`» به مرز کامل Bot API گسترش یافت و `pipeline` هم `process_approved_posts()` گرفت.
+  4. **Invariant ۲ و ۷ اصلاح شدند و Invariant ۱۲ و ۱۳ اضافه شدند** (بخش ۷): شرط تأیید ادمین به شرایط انتشار اضافه شد، صف‌های بازیابی از یکی به سه تا رسید (`new`/`approved`/`to_send`)، گذارهای وضعیت باید اتمیک باشند و «هیچ پستی قبل از تأیید به LLM نمی‌رود، و پیام ریویو هرگز حذف نمی‌شود» به‌عنوان قانون تخلف‌ناپذیر ثبت شد.
+  5. **Schema پست‌ها گسترش یافت** (بخش ۱۰): `review_status` جدا از `status` (تصمیم انسانی در مقابل وضعیت ماشین)، سابقهٔ کامل تصمیم (`reviewed_by`/`reviewed_at`/`approved_at`/`rejected_at`)، شناسهٔ پیام‌های دو کانال، `ai_processed_at`/`ai_error`، و وضعیت‌های تازه `awaiting_review`/`approved`/`rejected`/`publishing`. هم‌چنین `published_at` از «زمان انتشار پست در ریدیت» به «زمان انتشار ما در کانال عمومی» تغییر معنا داد و آن یکی به `posted_at` تغییر نام داد؛ `sent_at` هم با `published_at` جایگزین شد تا دو ستون هم‌معنا نداشته باشیم.
+  6. **تفکیک دیتابیس تست جایزهٔ خودش را داد**: چون جریان ریویو در SQL شرطی است، تست‌های pipeline از repository درون‌حافظه‌ای به Postgres واقعی منتقل شدند و `apply_schema()` جدول‌های دیتابیس تست را از صفر می‌سازد (اگر دیتابیس تستی از فاز قبل می‌ماند، ساکت شکست می‌خورد — یک باگ واقعی که همان لحظه دیده شد).
+  7. **یک باگ واقعی که همین تست‌ها گرفتند**: `PostRecord` روی ردیفی که `key_points` آن `NULL` است (پست تازه‌ذخیره‌شده قبل از تحلیل) شکست می‌خورد؛ حالا `NULL` به لیست خالی تبدیل می‌شود.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — پنل ادمین در تلگرام)** — موضوعات و منابع در دیتابیس بودند ولی راه تغییرشان وجود نداشت، و «پنل مدیریت» در بخش ۲ خارج از دامنه بود؛ این پوشش با یک ماژول تازه و یک تصمیم شکل‌دهنده بسته شد:
+  1. **`app/admin.py` — پنل همان ربات است** (FR-14): دوازده دستور تک‌خطی (`/help`، `/topics`، `/addtopic`، `/renametopic`، `/toggletopic`، `/deltopic`، `/sources`، `/addsource`، `/setsourcetopic`، `/setsourcelimit`، `/togglesource`، `/delsource`) بدون conversation state، بدون منو و بدون دکمه. دلیل: `KISS` و YAGNI؛ هر دستور ورودی خودش را کامل در همان خط می‌گیرد، پس هیچ حالت بین دو پیام نگه‌داری نمی‌شود و ماژول کاملاً بدون state است.
+  2. **روتینگ update در `telegram_updates.route`**: `callback_query` همچنان به `review` می‌رود و `message` تازه به `admin` می‌رود، پس تنها جای read کردن `update_id` همان یک ماژول باقی می‌ماند و `ALLOWED_UPDATES` هم `message` را اضافه کرده است.
+  3. **آزادسازی موضوع، سابقه را نمی‌خورد**: `posts.source_topic_key` عمداً FK به `topics` نیست، پس `/deltopic` موضوع و منابعش را حذف می‌کند ولی پست‌های ذخیره‌شده و سابقهٔ ریویو (با کلید متنی قدیمی) سالم می‌مانند — همین رفتار در پاسخ دستور هم به ادمین گفته می‌شود.
+- **۲۰۲۶-۰۹-۲۹ (فاز ۵ — preflight اسکیما)** — یک باگ واقعی که فقط با اجرای روی محیط واقعی دیده شد: volume دیتابیس از فاز ۴ مانده بود و `db/schema.sql` هم به‌خاطر `CREATE TABLE IF NOT EXISTS` جدول `posts` را با ستون‌های قدیمی رها می‌کرد؛ نتیجه این بود که هر دور با `UndefinedTable` می‌مرد، `_run_safely` آن را در لاگ فرو می‌برد و `worker` سالم به‌نظر می‌رسید ولی هیچ‌کاری نمی‌کرد. دو راه‌حل کمینه: `main.preflight()` در استارتاپ سه جدول را با همان لیست ستون‌های خواندهٔ واقعی تست می‌کند و با پیام قابل‌اقدام (شامل دستور `down -v`) خارج می‌شود، و بخش ۱۳ همین نکته را برای دیتابیس‌های باقی‌مانده باز می‌کند. `find_unusable_tables()` به‌جای «فقط وجود جدول»، خودِ کوئری‌های واقعی را با `LIMIT 0` اجرا می‌کند، پس هم جدول غایب و هم جدول با ستون‌های قدیمی را می‌گیرد.

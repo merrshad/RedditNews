@@ -1,11 +1,12 @@
 """Shared fixtures and test doubles.
 
-Unit tests never touch the network (RSS/LLM/Telegram are faked, NFR-8). The database
-tests are integration tests against a real Postgres (`docker compose up -d db`); when
-no database is reachable they skip themselves with a clear message, so a plain
-`pytest` still works on a machine without Docker.
+Unit tests never touch the network (RSS/LLM/Telegram are faked, NFR-8). Storage is *not*
+faked any more (phase 5): the review/publication flow is a state machine spread over
+conditional SQL, so the pipeline and repository tests run against a real Postgres through
+``db/schema.sql``. When no database is reachable they skip themselves with a clear
+message, so a plain ``pytest`` still works on a machine without Docker.
 
-The database tests own a *separate* database (`<DATABASE_URL>_test`, created on demand).
+Those database tests own a *separate* database (`<DATABASE_URL>_test`, created on demand).
 They used to run against the configured one, which meant a real `docker compose up` run —
 which is exactly what phase 4 asks for — wrote analysed posts into the same `posts` table
 and broke five candidate/duplicate tests (observed). Isolating the two is what keeps
@@ -16,16 +17,15 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from app.models import PostRecord
-from app.reddit_source import TopicConfig, TopicsConfig
+from app.models import TopicRecord
 from app.settings import Settings, get_settings
 
 # Defaults for the env vars `app/settings.py` requires. `setdefault` never overrides
@@ -38,14 +38,19 @@ os.environ.setdefault("OPENAI_BASE_URL", "https://llm.example/v1")
 os.environ.setdefault("OPENAI_MODEL", "test-model")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "000000:test-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "-100123")
+os.environ.setdefault("TELEGRAM_REVIEW_CHANNEL_ID", "-100999")
+os.environ.setdefault("TELEGRAM_ADMIN_IDS", "777,888")
+os.environ.setdefault("RSS_FETCH_LIMIT", "25")
 os.environ.setdefault("HTTP_MAX_RETRIES", "2")
 os.environ.setdefault("LOG_LEVEL", "INFO")
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 
-# Rows created by the database tests carry this prefix so they can be cleaned up
-# without touching anything else in the database.
+# Everything the tests create carries one of these prefixes, so they can be cleaned up
+# without touching the seeded topics/sources or anything else in the database.
 TEST_REDDIT_ID_PREFIX = "t3_test_"
+TEST_TOPIC_KEY_PREFIX = "t_test_"
+TEST_SOURCE_URL_PREFIX = "https://test.example/"
 
 # Name suffix of the database the integration tests use, and its URL.
 TEST_DATABASE_SUFFIX = "_test"
@@ -72,14 +77,6 @@ TEST_DATABASE_URL = _with_test_suffix(DATABASE_URL)
 # `setdefault`): the tests must never run against the database a real worker writes to.
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
-_REPOSITORY_API = (
-    "exists",
-    "save",
-    "update_status",
-    "fetch_recent_candidates",
-    "fetch_pending_to_send",
-)
-
 
 class FakeChatCompletion:
     """Stand-in for ``app.analyzer.chat_completion``: records prompts, replays an answer."""
@@ -93,100 +90,80 @@ class FakeChatCompletion:
         return self.answer
 
 
-class FakeSender:
-    """Stand-in for ``app.telegram_notifier.send_message`` (NFR-8: no network).
+class FakeTelegram:
+    """Stand-in for the whole ``app.telegram_notifier`` surface the flow uses (NFR-8).
 
-    It mirrors the real contract — text in, ``True`` only when Telegram accepted the
-    message — so a rejected send comes back as ``False`` and the pipeline keeps the record
-    as ``to_send`` for the next run (FR-10/FR-11).
+    It mirrors the real contract — a send answers with Telegram's ``message_id`` or ``None``
+    — so a rejected send keeps the post for a later run (FR-10/FR-11). ``fail_next_sends``
+    simulates a Telegram outage for the next N sends, which is how the retry paths are
+    exercised.
     """
 
-    def __init__(self, *, accept: bool = True, fail_first: bool = False) -> None:
+    def __init__(self, *, accept: bool = True) -> None:
         self.accept = accept
-        self.fail_first = fail_first
-        self.messages: list[str] = []
+        self.fail_next_sends = 0
+        # What the real `send_message` falls back to when no chat is given: the public
+        # channel. `patch_telegram` fills it from the settings under test.
+        self.default_chat_id: str = ""
+        #: (text, chat_id, reply_markup)
+        self.sent: list[tuple[str, str | None, dict[str, Any] | None]] = []
+        #: (text, chat_id, message_id)
+        self.edits: list[tuple[str, str, int]] = []
+        #: (callback_query_id, answer text)
+        self.answers: list[tuple[str, str | None]] = []
+        self._message_id = 1000
 
-    def __call__(self, text: str) -> bool:
-        if self.fail_first:
-            self.fail_first = False
-            return False
+    def send_message(
+        self,
+        text: str,
+        *,
+        chat_id: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> int | None:
+        if self.fail_next_sends > 0:
+            self.fail_next_sends -= 1
+            return None
         if not self.accept:
-            return False
-        self.messages.append(text)
+            return None
+        self._message_id += 1
+        self.sent.append((text, chat_id or self.default_chat_id, reply_markup))
+        return self._message_id
+
+    def edit_message_text(
+        self,
+        text: str,
+        *,
+        chat_id: str,
+        message_id: int,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        self.edits.append((text, chat_id, message_id))
         return True
 
+    def answer_callback_query(self, callback_query_id: str, *, text: str | None = None) -> bool:
+        self.answers.append((callback_query_id, text))
+        return True
 
-class FailingSender(FakeSender):
-    """A notifier that always reports a rejected send (Telegram is down)."""
+    def messages_to(self, chat_id: str | None) -> list[str]:
+        """Texts delivered to one chat, in order."""
+        return [text for text, target, _ in self.sent if target == chat_id]
 
-    def __init__(self) -> None:
-        super().__init__(accept=False)
-
-
-class FakeRepository:
-    """In-memory stand-in for the ``app.repository`` functions (NFR-8).
-
-    Mirrors that module's public API exactly, so a test can swap in the whole storage
-    layer with :func:`patch_repository` and still assert on the order of the calls.
-    """
-
-    def __init__(
-        self,
-        *,
-        existing: tuple[str, ...] = (),
-        candidates: tuple[PostRecord, ...] = (),
-        pending: tuple[PostRecord, ...] = (),
-    ) -> None:
-        self.existing: dict[str, int] = {
-            reddit_id: 50 + index for index, reddit_id in enumerate(existing)
-        }
-        self.candidates = list(candidates)
-        self.pending = list(pending)
-        self.saved: list[PostRecord] = []
-        self.updates: list[tuple[int, str, datetime | None]] = []
-        self.calls: list[str] = []
-        self._next_id = 100
-
-    def exists(self, reddit_id: str) -> bool:
-        self.calls.append("exists")
-        return reddit_id in self.existing
-
-    def save(self, post: PostRecord) -> int:
-        self.calls.append("save")
-        if post.reddit_id in self.existing:
-            return self.existing[post.reddit_id]
-        self._next_id += 1
-        self.existing[post.reddit_id] = self._next_id
-        self.saved.append(post)
-        return self._next_id
-
-    def update_status(self, post_id: int, status: str, sent_at: datetime | None = None) -> None:
-        self.calls.append("update_status")
-        self.updates.append((post_id, status, sent_at))
-
-    def fetch_recent_candidates(self, limit: int, hours: int) -> list[PostRecord]:
-        self.calls.append(f"fetch_recent_candidates(limit={limit},hours={hours})")
-        return list(self.candidates)
-
-    def fetch_pending_to_send(self) -> list[PostRecord]:
-        self.calls.append("fetch_pending_to_send")
-        return list(self.pending)
-
-    @property
-    def sent_ids(self) -> list[int]:
-        """Ids that were marked ``sent``, in order."""
-        return [post_id for post_id, status, _ in self.updates if status == "sent"]
-
-    @property
-    def last_id(self) -> int:
-        return self._next_id
+    def buttons_to(self, chat_id: str | None) -> list[dict[str, Any] | None]:
+        return [markup for _, target, markup in self.sent if target == chat_id]
 
 
-def patch_repository(monkeypatch: pytest.MonkeyPatch, repository: FakeRepository) -> FakeRepository:
-    """Point every ``app.repository`` function at an in-memory fake."""
-    for name in _REPOSITORY_API:
-        monkeypatch.setattr(f"app.repository.{name}", getattr(repository, name))
-    return repository
+def patch_telegram(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeTelegram, *, default_chat_id: str = ""
+) -> FakeTelegram:
+    """Point the Telegram boundary at a fake (one seam for notifications and reviews)."""
+    if default_chat_id:
+        fake.default_chat_id = default_chat_id
+    monkeypatch.setattr("app.telegram_notifier.send_message", fake.send_message)
+    monkeypatch.setattr("app.telegram_notifier.edit_message_text", fake.edit_message_text)
+    monkeypatch.setattr(
+        "app.telegram_notifier.answer_callback_query", fake.answer_callback_query
+    )
+    return fake
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +184,10 @@ def settings() -> Settings:
         openai_model="test-model",
         telegram_bot_token="000000:test-token",
         telegram_chat_id="-100123",
+        telegram_review_channel_id="-100999",
+        telegram_admin_ids="777,888",
         poll_interval_seconds=1,
+        rss_fetch_limit=25,
         similarity_lookback_limit=50,
         similarity_lookback_hours=72,
         min_importance_to_send="low",
@@ -216,31 +196,19 @@ def settings() -> Settings:
     )
 
 
-@pytest.fixture
-def topics_config() -> TopicsConfig:
-    return TopicsConfig(
-        topics=[
-            TopicConfig(
-                key="ai",
-                name="هوش مصنوعی",
-                feeds=["https://www.reddit.com/r/MachineLearning/new/.rss"],
-            ),
-            TopicConfig(
-                key="startup",
-                name="استارتاپ",
-                feeds=["https://www.reddit.com/r/startups/new/.rss"],
-            ),
-        ]
-    )
-
-
 def apply_schema() -> None:
-    """Apply ``db/schema.sql`` — the single source of truth for the schema (Invariant 9).
+    """Rebuild the *test* database from ``db/schema.sql`` (Invariant 9).
 
-    The container applies it on first boot too; running it again is idempotent and
-    keeps the tests working against any fresh Postgres.
+    ``db/schema.sql`` is the single source of truth for the schema, but it is not a
+    migration: ``CREATE TABLE IF NOT EXISTS`` cannot add a column to a table that already
+    exists, so a test database left over from an earlier phase would silently keep the old
+    columns. Dropping the three tables first is safe here — this is the dedicated
+    ``<DATABASE_URL>_test`` database that ``conftest`` itself creates, never the one a
+    running worker uses — and it makes the tests fail loudly instead of mysteriously when
+    the schema moves.
     """
     with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as connection:
+        connection.execute("DROP TABLE IF EXISTS posts, sources, topics CASCADE")
         connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
@@ -261,7 +229,7 @@ def create_test_database() -> None:
 
 
 def delete_test_rows(connection: psycopg.Connection) -> None:
-    """Remove only the rows these tests created (matched by reddit_id prefix)."""
+    """Remove only the rows these tests created (matched by their test prefixes)."""
     with connection.cursor() as cursor:
         cursor.execute(
             "UPDATE posts SET duplicate_of_id = NULL WHERE reddit_id LIKE %s",
@@ -270,6 +238,60 @@ def delete_test_rows(connection: psycopg.Connection) -> None:
         cursor.execute(
             "DELETE FROM posts WHERE reddit_id LIKE %s", (f"{TEST_REDDIT_ID_PREFIX}%",)
         )
+        # Deleting a topic cascades to its sources (db/schema.sql).
+        cursor.execute(
+            "DELETE FROM topics WHERE key LIKE %s", (f"{TEST_TOPIC_KEY_PREFIX}%",)
+        )
+        cursor.execute(
+            "DELETE FROM sources WHERE rss_url LIKE %s", (f"{TEST_SOURCE_URL_PREFIX}%",)
+        )
+
+
+def insert_topic(
+    connection: psycopg.Connection,
+    key: str,
+    name: str = "موضوع تست",
+    *,
+    is_active: bool = True,
+) -> int:
+    """Create a test topic directly in the database and return its id."""
+    row = connection.execute(
+        "INSERT INTO topics (key, name, is_active) VALUES (%s, %s, %s) RETURNING id",
+        (f"{TEST_TOPIC_KEY_PREFIX}{key}", name, is_active),
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
+def insert_source(
+    connection: psycopg.Connection,
+    topic_key: str,
+    rss_url: str,
+    *,
+    fetch_limit: int | None = None,
+    is_active: bool = True,
+) -> int:
+    """Create a test source under a test topic and return its id."""
+    row = connection.execute(
+        """
+        INSERT INTO sources (topic_id, rss_url, fetch_limit, is_active)
+        SELECT id, %s, %s, %s FROM topics WHERE key = %s
+        RETURNING id
+        """,
+        (f"{TEST_SOURCE_URL_PREFIX}{rss_url}", fetch_limit, is_active, f"{TEST_TOPIC_KEY_PREFIX}{topic_key}"),
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
+def temp_topic_key(key: str) -> str:
+    """The prefixed key a test topic is stored under."""
+    return f"{TEST_TOPIC_KEY_PREFIX}{key}"
+
+
+def temp_source_url(path: str) -> str:
+    """The prefixed URL a test source is stored under."""
+    return f"{TEST_SOURCE_URL_PREFIX}{path}"
 
 
 @pytest.fixture(scope="session")
@@ -294,3 +316,12 @@ def db_connection(postgres_database: str) -> Iterator[psycopg.Connection]:
             yield connection
         finally:
             delete_test_rows(connection)
+
+
+@pytest.fixture
+def topic_records() -> list[TopicRecord]:
+    """A small in-memory taxonomy for the tests that never touch the database."""
+    return [
+        TopicRecord(id=1, key="ai", name="هوش مصنوعی"),
+        TopicRecord(id=2, key="startup", name="استارتاپ"),
+    ]
